@@ -12,13 +12,13 @@ video and producing a four-quadrant analysis video:
 ## Setup
 
 ```bash
-python -m pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 ```
 
 ## Usage
 
 ```bash
-python video_jitter_stabilizer.py input.mp4 \
+python3 video_jitter_stabilizer.py input.mp4 \
   --output output_jitter_analysis.mp4 \
   --csv shifts.csv
 ```
@@ -44,5 +44,5 @@ Press `q` to stop the live preview.
 Useful options:
 
 ```bash
-python video_jitter_stabilizer.py --help
+python3 video_jitter_stabilizer.py --help
 ```
