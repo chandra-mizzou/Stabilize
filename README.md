@@ -128,30 +128,37 @@ python3 top100_keypoint_stabilizer.py input.mp4 \
   --output top100_analysis.mp4 \
   --csv top100_shifts.csv \
   --num-frames 100 \
+  --crop-size 512 \
   --process-size 256 \
   --analysis-size 256
 ```
 
-The script resizes every input frame to `256x256` by default before Key.Net
-processing. The stabilized-only output is also `256x256`. The four-quadrant
-analysis view is downsampled and saved as a compact `256x256` video by default
-so it is only used for quick diagnostics.
+The script center-crops every input frame to `512x512` by default, then resizes
+that crop to `256x256` before Key.Net processing. If an input frame is smaller
+than `512x512`, it is centered on a black `512x512` canvas before resizing. The
+stabilized-only output is `256x256`. The four-quadrant analysis view is
+downsampled and saved as a compact `256x256` video by default so it is only used
+for quick diagnostics.
 
 Algorithm:
 
-1. Detect the top 100 Key.Net keypoints in the previous frame and current frame.
-2. Match the top-keypoint descriptors between immediate consecutive frames.
-3. Compute the average matched keypoint shift `(dx, dy)`.
-4. Accumulate the shift within the current reference segment.
-5. Move the current frame back by the inverse cumulative shift.
-6. Use black zero-padding for newly exposed image regions so the resolution is
+1. Center-crop each input frame to `512x512`.
+2. Resize the crop to `256x256`.
+3. Detect the top 100 Key.Net keypoints in the previous frame and current frame.
+4. Match the top-keypoint descriptors between immediate consecutive frames.
+5. Compute the average matched keypoint shift `(dx, dy)`.
+6. Accumulate the shift within the current reference segment.
+7. Move the current frame back by the inverse cumulative shift.
+8. Use black zero-padding for newly exposed image regions so the resolution is
    unchanged.
-7. If at least 10 of the top 100 keypoints are no longer matched, make the
+9. If at least 10 of the top 100 keypoints are no longer matched, make the
    current frame the new reference segment.
 
 Tune these options:
 
 - `--top-k 100`: number of top Key.Net keypoints.
+- `--crop-size 512`: square center crop size before resizing. Smaller frames
+  are centered on a black canvas.
 - `--process-size 256`: square frame size used for keypoint extraction and
   stabilization.
 - `--analysis-size 256`: final square size of the four-quadrant analysis video.

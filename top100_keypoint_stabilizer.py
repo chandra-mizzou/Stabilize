@@ -21,6 +21,7 @@ import numpy as np
 DEFAULT_TOP_K = 100
 DEFAULT_RESET_THRESHOLD = 10
 DEFAULT_NUM_FRAMES = 100
+DEFAULT_CROP_SIZE = 512
 DEFAULT_PROCESS_SIZE = 256
 DEFAULT_ANALYSIS_SIZE = 256
 
@@ -120,6 +121,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_NUM_FRAMES,
         help=f"Number of frames to process from the start (default: {DEFAULT_NUM_FRAMES}; 0 means full video).",
+    )
+    parser.add_argument(
+        "--crop-size",
+        type=int,
+        default=DEFAULT_CROP_SIZE,
+        help=(
+            "Center crop each input frame to this square size before resizing "
+            f"for processing (default: {DEFAULT_CROP_SIZE}). Smaller frames are zero-padded."
+        ),
     )
     parser.add_argument(
         "--process-size",
@@ -273,9 +283,31 @@ def translate_with_zero_padding(frame: np.ndarray, correction: np.ndarray) -> np
     )
 
 
-def resize_to_square(frame: np.ndarray, size: int) -> np.ndarray:
-    """Resize a frame to the square processing resolution."""
-    return cv2.resize(frame, (size, size), interpolation=cv2.INTER_AREA)
+def center_crop_or_pad_square(frame: np.ndarray, size: int) -> np.ndarray:
+    """Center-crop to size x size, zero-padding first if the frame is smaller."""
+    height, width = frame.shape[:2]
+    crop_width = min(width, size)
+    crop_height = min(height, size)
+    x0 = max(0, (width - crop_width) // 2)
+    y0 = max(0, (height - crop_height) // 2)
+    cropped = frame[y0 : y0 + crop_height, x0 : x0 + crop_width]
+
+    if crop_width == size and crop_height == size:
+        return cropped
+
+    output = np.zeros((size, size, frame.shape[2]), dtype=frame.dtype)
+    paste_x = (size - crop_width) // 2
+    paste_y = (size - crop_height) // 2
+    output[paste_y : paste_y + crop_height, paste_x : paste_x + crop_width] = cropped
+    return output
+
+
+def preprocess_frame(frame: np.ndarray, crop_size: int, process_size: int) -> np.ndarray:
+    """Center crop to crop_size x crop_size, then resize for processing."""
+    cropped = center_crop_or_pad_square(frame, crop_size)
+    if crop_size == process_size:
+        return cropped
+    return cv2.resize(cropped, (process_size, process_size), interpolation=cv2.INTER_AREA)
 
 
 def make_analysis_frame(panel: np.ndarray, analysis_size: int) -> np.ndarray:
@@ -459,6 +491,8 @@ def process_video(args: argparse.Namespace) -> None:
         raise ValueError("--reset-threshold must be non-negative")
     if args.num_frames < 0:
         raise ValueError("--num-frames must be non-negative")
+    if args.crop_size < 16:
+        raise ValueError("--crop-size must be at least 16")
     if args.process_size < 16:
         raise ValueError("--process-size must be at least 16")
     if args.analysis_size < 16:
@@ -480,14 +514,15 @@ def process_video(args: argparse.Namespace) -> None:
         raise RuntimeError(f"Could not read first frame: {args.input_video}")
 
     print(
-        f"Resizing frames to {args.process_size}x{args.process_size} before processing.",
+        f"Center-cropping frames to {args.crop_size}x{args.crop_size}, "
+        f"then resizing to {args.process_size}x{args.process_size} before processing.",
         flush=True,
     )
     print(
         f"Saving analysis video at {args.analysis_size}x{args.analysis_size}.",
         flush=True,
     )
-    first_frame = resize_to_square(first_frame, args.process_size)
+    first_frame = preprocess_frame(first_frame, args.crop_size, args.process_size)
     height, width = first_frame.shape[:2]
     panel_writer = cv2.VideoWriter(
         str(output_path),
@@ -540,7 +575,7 @@ def process_video(args: argparse.Namespace) -> None:
         if not success:
             break
         frame_no += 1
-        frame = resize_to_square(frame, args.process_size)
+        frame = preprocess_frame(frame, args.crop_size, args.process_size)
 
         if frame_no % args.progress_every == 0:
             print(f"frame {frame_no}: extracting top keypoints...", flush=True)
