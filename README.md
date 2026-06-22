@@ -127,8 +127,15 @@ python3 top100_keypoint_stabilizer.py input.mp4 \
   --stable-output top100_stable.mp4 \
   --output top100_analysis.mp4 \
   --csv top100_shifts.csv \
-  --num-frames 100
+  --num-frames 100 \
+  --process-size 256 \
+  --analysis-size 256
 ```
+
+The script resizes every input frame to `256x256` by default before Key.Net
+processing. The stabilized-only output is also `256x256`. The four-quadrant
+analysis view is downsampled and saved as a compact `256x256` video by default
+so it is only used for quick diagnostics.
 
 Algorithm:
 
@@ -145,10 +152,15 @@ Algorithm:
 Tune these options:
 
 - `--top-k 100`: number of top Key.Net keypoints.
+- `--process-size 256`: square frame size used for keypoint extraction and
+  stabilization.
+- `--analysis-size 256`: final square size of the four-quadrant analysis video.
 - `--reset-threshold 10`: number of changed/unmatched top keypoints before a
   reference reset.
 - `--match-ratio`: stricter or looser descriptor matching.
 - `--max-shift`: rejects implausibly large average shifts.
+- `--progress-every 1`: print progress every frame. Increase it to reduce log
+  volume.
 
 New keypoints usually appear when the camera/scene content moves enough to
 expose new texture, but that is not the only cause. Lighting changes, blur,

@@ -21,6 +21,8 @@ import numpy as np
 DEFAULT_TOP_K = 100
 DEFAULT_RESET_THRESHOLD = 10
 DEFAULT_NUM_FRAMES = 100
+DEFAULT_PROCESS_SIZE = 256
+DEFAULT_ANALYSIS_SIZE = 256
 
 
 @dataclass
@@ -46,7 +48,8 @@ class FrameResult:
 class KeyNetTopKExtractor:
     """Extract top-K Key.Net keypoints and HardNet descriptors using Kornia."""
 
-    def __init__(self, top_k: int, feature_max_size: int, device: str) -> None:
+    def __init__(self, top_k: int, device: str) -> None:
+        print("Loading Key.Net-HardNet model...", flush=True)
         try:
             import torch
             import kornia.feature as kornia_feature
@@ -62,26 +65,16 @@ class KeyNetTopKExtractor:
         self.torch = torch
         self.kornia_feature = kornia_feature
         self.device = torch.device(device)
-        self.feature_max_size = max(0, feature_max_size)
         self.model = kornia_feature.KeyNetHardNet(
             num_features=top_k,
             upright=True,
             device=self.device,
         ).to(self.device)
         self.model.eval()
+        print(f"Loaded Key.Net-HardNet model on {self.device}.", flush=True)
 
     def extract(self, frame: np.ndarray) -> FeatureSet:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        original_height, original_width = gray.shape[:2]
-        scale = 1.0
-        if self.feature_max_size > 0:
-            longest_side = max(original_height, original_width)
-            if longest_side > self.feature_max_size:
-                scale = self.feature_max_size / float(longest_side)
-                resized_width = max(1, int(round(original_width * scale)))
-                resized_height = max(1, int(round(original_height * scale)))
-                gray = cv2.resize(gray, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
-
         tensor = self.torch.from_numpy(gray.astype(np.float32) / 255.0)
         tensor = tensor[None, None].to(self.device)
         with self.torch.inference_mode():
@@ -89,8 +82,6 @@ class KeyNetTopKExtractor:
             centers = self.kornia_feature.get_laf_center(lafs)[0]
 
         points = centers.detach().cpu().numpy().astype(np.float32)
-        if scale != 1.0:
-            points /= scale
         descriptors_np = descriptors[0].detach().cpu().numpy().astype(np.float32)
         if len(points) == 0 or len(descriptors_np) == 0:
             return FeatureSet(
@@ -131,6 +122,24 @@ def parse_args() -> argparse.Namespace:
         help=f"Number of frames to process from the start (default: {DEFAULT_NUM_FRAMES}; 0 means full video).",
     )
     parser.add_argument(
+        "--process-size",
+        type=int,
+        default=DEFAULT_PROCESS_SIZE,
+        help=(
+            "Resize every frame to this square size before keypoint extraction, "
+            f"stabilization, and stable output (default: {DEFAULT_PROCESS_SIZE})."
+        ),
+    )
+    parser.add_argument(
+        "--analysis-size",
+        type=int,
+        default=DEFAULT_ANALYSIS_SIZE,
+        help=(
+            "Final square size of the four-quadrant analysis video "
+            f"(default: {DEFAULT_ANALYSIS_SIZE})."
+        ),
+    )
+    parser.add_argument(
         "--top-k",
         type=int,
         default=DEFAULT_TOP_K,
@@ -150,12 +159,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.85,
         help="Mutual Lowe-ratio threshold for descriptor matching (default: 0.85).",
-    )
-    parser.add_argument(
-        "--feature-max-size",
-        type=int,
-        default=960,
-        help="Resize longest side before Key.Net extraction for speed (default: 960; 0 disables).",
     )
     parser.add_argument(
         "--min-matches",
@@ -185,6 +188,12 @@ def parse_args() -> argparse.Namespace:
         "--display",
         action="store_true",
         help="Display the four-quadrant output while processing. Press q to stop.",
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=1,
+        help="Print progress every N frames (default: 1).",
     )
     parser.add_argument(
         "--device",
@@ -262,6 +271,16 @@ def translate_with_zero_padding(frame: np.ndarray, correction: np.ndarray) -> np
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(0, 0, 0),
     )
+
+
+def resize_to_square(frame: np.ndarray, size: int) -> np.ndarray:
+    """Resize a frame to the square processing resolution."""
+    return cv2.resize(frame, (size, size), interpolation=cv2.INTER_AREA)
+
+
+def make_analysis_frame(panel: np.ndarray, analysis_size: int) -> np.ndarray:
+    """Resize the four-panel diagnostic view to the requested analysis size."""
+    return cv2.resize(panel, (analysis_size, analysis_size), interpolation=cv2.INTER_AREA)
 
 
 def draw_matches(
@@ -440,6 +459,12 @@ def process_video(args: argparse.Namespace) -> None:
         raise ValueError("--reset-threshold must be non-negative")
     if args.num_frames < 0:
         raise ValueError("--num-frames must be non-negative")
+    if args.process_size < 16:
+        raise ValueError("--process-size must be at least 16")
+    if args.analysis_size < 16:
+        raise ValueError("--analysis-size must be at least 16")
+    if args.progress_every < 1:
+        raise ValueError("--progress-every must be at least 1")
 
     output_path = args.output or args.input_video.with_name(f"{args.input_video.stem}_top100_analysis.mp4")
     cap = cv2.VideoCapture(str(args.input_video))
@@ -454,12 +479,21 @@ def process_video(args: argparse.Namespace) -> None:
     if not success:
         raise RuntimeError(f"Could not read first frame: {args.input_video}")
 
+    print(
+        f"Resizing frames to {args.process_size}x{args.process_size} before processing.",
+        flush=True,
+    )
+    print(
+        f"Saving analysis video at {args.analysis_size}x{args.analysis_size}.",
+        flush=True,
+    )
+    first_frame = resize_to_square(first_frame, args.process_size)
     height, width = first_frame.shape[:2]
     panel_writer = cv2.VideoWriter(
         str(output_path),
         cv2.VideoWriter_fourcc(*"mp4v"),
         fps,
-        (width * 2, height * 2),
+        (args.analysis_size, args.analysis_size),
     )
     if not panel_writer.isOpened():
         raise RuntimeError(f"Could not open output writer: {output_path}")
@@ -475,8 +509,10 @@ def process_video(args: argparse.Namespace) -> None:
         if not stable_writer.isOpened():
             raise RuntimeError(f"Could not open stabilized writer: {args.stable_output}")
 
-    extractor = KeyNetTopKExtractor(args.top_k, args.feature_max_size, args.device)
+    extractor = KeyNetTopKExtractor(args.top_k, args.device)
+    print("Extracting top keypoints for frame 1...", flush=True)
     previous_features = extractor.extract(first_frame)
+    print(f"frame 1: extracted {len(previous_features.points)} keypoints", flush=True)
     reference_correction = np.zeros(2, dtype=np.float32)
     cumulative_shift = np.zeros(2, dtype=np.float32)
 
@@ -493,7 +529,7 @@ def process_video(args: argparse.Namespace) -> None:
     first_overlay = first_frame.copy()
     draw_text_lines(first_overlay, [f"reference frame, top keypoints: {len(previous_features.points)}"], origin_y=58)
     first_panel = make_four_panel(first_frame, first_overlay, first_plot, first_frame.copy())
-    panel_writer.write(first_panel)
+    panel_writer.write(make_analysis_frame(first_panel, args.analysis_size))
     if stable_writer is not None:
         stable_writer.write(first_frame)
 
@@ -504,7 +540,10 @@ def process_video(args: argparse.Namespace) -> None:
         if not success:
             break
         frame_no += 1
+        frame = resize_to_square(frame, args.process_size)
 
+        if frame_no % args.progress_every == 0:
+            print(f"frame {frame_no}: extracting top keypoints...", flush=True)
         current_features = extractor.extract(frame)
         matched_prev, matched_curr = match_top_keypoints(previous_features, current_features, args.match_ratio)
         mean_shift, valid_shift = average_shift(matched_prev, matched_curr, args.min_matches, args.max_shift)
@@ -519,6 +558,15 @@ def process_video(args: argparse.Namespace) -> None:
         matched_count = int(len(matched_curr))
         changed_count = max(0, min(args.top_k, args.top_k - matched_count))
         reset_reference = changed_count >= args.reset_threshold or not valid_shift
+        if frame_no % args.progress_every == 0:
+            print(
+                f"frame {frame_no}: keypoints={len(current_features.points)}, "
+                f"matches={matched_count}, changed={changed_count}, "
+                f"shift=({mean_shift[0]:.2f}, {mean_shift[1]:.2f}), "
+                f"correction=({correction[0]:.2f}, {correction[1]:.2f}), "
+                f"reset={'yes' if reset_reference else 'no'}",
+                flush=True,
+            )
 
         overlay = draw_matches(
             frame,
@@ -547,7 +595,9 @@ def process_video(args: argparse.Namespace) -> None:
             ],
             origin_y=58,
         )
-        panel_writer.write(make_four_panel(frame, overlay, plot, stabilized_for_panel))
+        panel = make_four_panel(frame, overlay, plot, stabilized_for_panel)
+        analysis_frame = make_analysis_frame(panel, args.analysis_size)
+        panel_writer.write(analysis_frame)
         if stable_writer is not None:
             stable_writer.write(stabilized)
 
@@ -567,7 +617,7 @@ def process_video(args: argparse.Namespace) -> None:
         )
 
         if args.display:
-            cv2.imshow("top-100 keypoint stabilizer", make_four_panel(frame, overlay, plot, stabilized_for_panel))
+            cv2.imshow("top-100 keypoint stabilizer", analysis_frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
@@ -575,7 +625,7 @@ def process_video(args: argparse.Namespace) -> None:
         if reset_reference:
             reference_correction = correction.copy()
             cumulative_shift = np.zeros(2, dtype=np.float32)
-            print(f"frame {frame_no}: reset reference, changed top keypoints={changed_count}")
+            print(f"frame {frame_no}: reset reference, changed top keypoints={changed_count}", flush=True)
 
     cap.release()
     panel_writer.release()
@@ -586,7 +636,7 @@ def process_video(args: argparse.Namespace) -> None:
     if args.csv:
         write_results_csv(args.csv, results)
 
-    print(f"Wrote four-quadrant analysis video: {output_path}")
+    print(f"Wrote {args.analysis_size}x{args.analysis_size} four-quadrant analysis video: {output_path}")
     if args.stable_output:
         print(f"Wrote stabilized-only video: {args.stable_output}")
     if args.csv:
