@@ -30,13 +30,15 @@ Press `q` to stop the live preview.
 
 - The first frame is used to detect reference Shi-Tomasi keypoints.
 - From the second frame onward, pyramidal Lucas-Kanade optical flow tracks
-  keypoints common with the previous frame.
+  keypoints common with the previous frame. Flow vectors are scaled before
+  drawing so small jitter is visible in the overlay panel.
 - The shift plot shows the average `(x, y)` displacement of first-frame
   reference keypoints versus frame number.
-- The stabilization path uses the frame-to-frame movement of common keypoints.
-  For the first few frames it corrects using the current measured movement.
-  Once the rolling window is full (five frames by default), it corrects the
-  current frame using the average movement over the recent window.
+- The stabilization path accumulates frame-to-frame movement into a raw shift
+  trajectory. For the first few frames it corrects the measured shift directly.
+  Once the rolling window is full (five frames by default), it subtracts the
+  difference between the current raw shift and the recent five-frame average.
+  This removes jitter while keeping the smoothed trajectory as the target.
 - When tracked points are lost because the video shifts, newly detected
   keypoints are added for future frames, so they can participate in correction
   once they become common with the previous frame.
@@ -46,3 +48,6 @@ Useful options:
 ```bash
 python3 video_jitter_stabilizer.py --help
 ```
+
+If optical-flow arrows are still too short for a low-amplitude jitter video,
+increase `--flow-scale`, for example `--flow-scale 15`.

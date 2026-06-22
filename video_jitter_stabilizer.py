@@ -92,6 +92,21 @@ def parse_args() -> argparse.Namespace:
         help="Draw every Nth optical-flow vector to reduce clutter (default: 4).",
     )
     parser.add_argument(
+        "--flow-scale",
+        type=float,
+        default=8.0,
+        help=(
+            "Scale optical-flow vectors before drawing so small jitter remains "
+            "visible (default: 8)."
+        ),
+    )
+    parser.add_argument(
+        "--flow-thickness",
+        type=int,
+        default=2,
+        help="Optical-flow vector line thickness in pixels (default: 2).",
+    )
+    parser.add_argument(
         "--plot-history",
         type=int,
         default=240,
@@ -229,22 +244,31 @@ def draw_flow_vectors(
     previous_points: np.ndarray,
     current_points: np.ndarray,
     stride: int,
+    scale: float,
+    thickness: int,
 ) -> np.ndarray:
     """Overlay optical-flow direction vectors on a frame."""
     overlay = frame.copy()
     points_prev = previous_points.reshape(-1, 2)
     points_curr = current_points.reshape(-1, 2)
     stride = max(1, stride)
+    scale = max(1.0, scale)
+    thickness = max(1, thickness)
+    deltas = points_curr - points_prev
+    average_motion = np.mean(deltas, axis=0) if len(deltas) > 0 else np.zeros(2, dtype=np.float32)
 
-    for prev, curr in zip(points_prev[::stride], points_curr[::stride]):
-        p0 = tuple(np.round(prev).astype(int))
-        p1 = tuple(np.round(curr).astype(int))
-        cv2.arrowedLine(overlay, p0, p1, (0, 255, 255), 1, tipLength=0.35)
-        cv2.circle(overlay, p1, 2, (0, 80, 255), -1)
+    for curr, delta in zip(points_curr[::stride], deltas[::stride]):
+        # Anchor vectors on the current feature location and scale the direction
+        # so low-amplitude camera jitter is visible in the output video.
+        p0 = tuple(np.round(curr).astype(int))
+        p1 = tuple(np.round(curr + delta * scale).astype(int))
+        cv2.arrowedLine(overlay, p0, p1, (0, 0, 0), thickness + 2, tipLength=0.35)
+        cv2.arrowedLine(overlay, p0, p1, (0, 255, 255), thickness, tipLength=0.35)
+        cv2.circle(overlay, p0, thickness + 1, (0, 80, 255), -1)
 
     cv2.putText(
         overlay,
-        f"Optical flow vectors: {len(points_curr)} tracked",
+        f"Optical flow: {len(points_curr)} pts, avg dx={average_motion[0]:.2f}, dy={average_motion[1]:.2f}",
         (12, 28),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
@@ -364,6 +388,16 @@ def label_panel(frame: np.ndarray, title: str) -> np.ndarray:
     return labeled
 
 
+def draw_status_text(frame: np.ndarray, lines: list[str], origin_y: int = 64) -> np.ndarray:
+    """Draw high-contrast status text below a panel title."""
+    output = frame.copy()
+    for index, line in enumerate(lines):
+        y = origin_y + index * 24
+        cv2.putText(output, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(output, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
+    return output
+
+
 def make_four_panel(
     original: np.ndarray,
     flow: np.ndarray,
@@ -440,11 +474,14 @@ def process_video(args: argparse.Namespace) -> None:
     shifts_y = [0.0]
     corrections_x = [0.0]
     corrections_y = [0.0]
-    recent_motions: deque[np.ndarray] = deque(maxlen=args.rolling_window)
-    cumulative_correction = np.zeros(2, dtype=np.float32)
+    raw_shift_history: deque[np.ndarray] = deque(maxlen=args.rolling_window)
+    raw_shift_estimate = np.zeros(2, dtype=np.float32)
+    applied_correction = np.zeros(2, dtype=np.float32)
 
     first_plot = draw_shift_plot(width, height, frame_numbers, shifts_x, shifts_y, args.plot_history)
-    first_panel = make_four_panel(first_frame, first_frame.copy(), first_plot, first_frame.copy())
+    first_flow = draw_status_text(first_frame, ["Reference frame: optical flow starts on frame 2"])
+    first_stabilized = draw_status_text(first_frame, ["Reference frame: no correction applied"])
+    first_panel = make_four_panel(first_frame, first_flow, first_plot, first_stabilized)
     writer.write(first_panel)
 
     if args.display:
@@ -464,12 +501,14 @@ def process_video(args: argparse.Namespace) -> None:
 
         common_previous, common_current = track_points(previous_gray, gray, active_points)
         instant_motion = mean_delta(common_previous, common_current)
-        recent_motions.append(instant_motion)
-        if len(recent_motions) >= args.rolling_window:
-            correction_step = moving_average(recent_motions)
+        raw_shift_estimate += instant_motion
+        raw_shift_history.append(raw_shift_estimate.copy())
+        if len(raw_shift_history) >= args.rolling_window:
+            smoothed_shift = moving_average(raw_shift_history)
+            applied_correction = raw_shift_estimate - smoothed_shift
         else:
-            correction_step = instant_motion
-        cumulative_correction += correction_step
+            smoothed_shift = np.zeros(2, dtype=np.float32)
+            applied_correction = raw_shift_estimate.copy()
 
         ref_initial_common, ref_current_common = track_reference_points(
             previous_gray,
@@ -486,8 +525,23 @@ def process_video(args: argparse.Namespace) -> None:
             reference_previous_points = np.empty((0, 1, 2), dtype=np.float32)
             reference_initial_points = np.empty((0, 1, 2), dtype=np.float32)
 
-        stabilized = translate_frame(frame, cumulative_correction)
-        flow = draw_flow_vectors(frame, common_previous, common_current, args.vector_stride)
+        stabilized = translate_frame(frame, applied_correction)
+        stabilized = draw_status_text(
+            stabilized,
+            [
+                f"raw shift dx={raw_shift_estimate[0]:.2f}, dy={raw_shift_estimate[1]:.2f}",
+                f"5-frame avg dx={smoothed_shift[0]:.2f}, dy={smoothed_shift[1]:.2f}",
+                f"applied correction dx={applied_correction[0]:.2f}, dy={applied_correction[1]:.2f}",
+            ],
+        )
+        flow = draw_flow_vectors(
+            frame,
+            common_previous,
+            common_current,
+            args.vector_stride,
+            args.flow_scale,
+            args.flow_thickness,
+        )
         active_points = refresh_keypoints(
             gray,
             common_current,
@@ -500,8 +554,8 @@ def process_video(args: argparse.Namespace) -> None:
         frame_numbers.append(frame_no)
         shifts_x.append(float(shift[0]))
         shifts_y.append(float(shift[1]))
-        corrections_x.append(float(cumulative_correction[0]))
-        corrections_y.append(float(cumulative_correction[1]))
+        corrections_x.append(float(applied_correction[0]))
+        corrections_y.append(float(applied_correction[1]))
 
         plot = draw_shift_plot(width, height, frame_numbers, shifts_x, shifts_y, args.plot_history)
         panel = make_four_panel(frame, flow, plot, stabilized)
