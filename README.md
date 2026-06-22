@@ -116,3 +116,41 @@ Useful tuning options:
 - `--match-ratio`: lower values make matching stricter.
 - `--ransac-threshold`: higher values tolerate noisier matches.
 - `--border-scale`: zooms the stabilized frame slightly to hide borders.
+
+## Top-100 keypoint shift stabilizer
+
+For pure azimuth/elevation jitter, `top100_keypoint_stabilizer.py` implements a
+more direct frame-to-frame translation correction:
+
+```bash
+python3 top100_keypoint_stabilizer.py input.mp4 \
+  --stable-output top100_stable.mp4 \
+  --output top100_analysis.mp4 \
+  --csv top100_shifts.csv \
+  --num-frames 100
+```
+
+Algorithm:
+
+1. Detect the top 100 Key.Net keypoints in the previous frame and current frame.
+2. Match the top-keypoint descriptors between immediate consecutive frames.
+3. Compute the average matched keypoint shift `(dx, dy)`.
+4. Accumulate the shift within the current reference segment.
+5. Move the current frame back by the inverse cumulative shift.
+6. Use black zero-padding for newly exposed image regions so the resolution is
+   unchanged.
+7. If at least 10 of the top 100 keypoints are no longer matched, make the
+   current frame the new reference segment.
+
+Tune these options:
+
+- `--top-k 100`: number of top Key.Net keypoints.
+- `--reset-threshold 10`: number of changed/unmatched top keypoints before a
+  reference reset.
+- `--match-ratio`: stricter or looser descriptor matching.
+- `--max-shift`: rejects implausibly large average shifts.
+
+New keypoints usually appear when the camera/scene content moves enough to
+expose new texture, but that is not the only cause. Lighting changes, blur,
+moving foreground objects, compression artifacts, and Key.Net score/ranking
+changes can also alter the top-100 set.
