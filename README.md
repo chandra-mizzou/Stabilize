@@ -1,13 +1,12 @@
 # Stabilize
 
 Python utility for measuring continuous x/y (azimuth/elevation) jitter in a
-video and producing a four-quadrant analysis video:
+video and producing a four-quadrant Key.Net stabilization analysis video:
 
 1. Original video
-2. Optical-flow vectors overlaid on each frame
-3. x/y average keypoint shift versus frame number, using first-frame keypoints
-   as the reference
-4. Jitter-corrected stabilized video
+2. Key.Net feature-motion vectors overlaid on each frame
+3. Raw and smoothed x/y camera-shift trajectory versus frame number
+4. Affine trajectory-stabilized video
 
 ## Setup
 
@@ -20,28 +19,49 @@ python3 -m pip install -r requirements.txt
 ```bash
 python3 video_jitter_stabilizer.py input.mp4 \
   --output output_jitter_analysis.mp4 \
-  --csv shifts.csv
+  --stable-output stable_only.mp4 \
+  --csv trajectory.csv
 ```
 
 Use `--display` to show the four-quadrant video while it is being processed.
 Press `q` to stop the live preview.
 
-## How correction works
+## How stabilization works
 
-- The first frame is used to detect reference Shi-Tomasi keypoints.
-- From the second frame onward, pyramidal Lucas-Kanade optical flow tracks
-  keypoints common with the previous frame. Flow vectors are scaled before
-  drawing so small jitter is visible in the overlay panel.
-- The shift plot shows the average `(x, y)` displacement of first-frame
-  reference keypoints versus frame number.
-- The stabilization path accumulates frame-to-frame movement into a raw shift
-  trajectory. For the first few frames it corrects the measured shift directly.
-  Once the rolling window is full (five frames by default), it subtracts the
-  difference between the current raw shift and the recent five-frame average.
-  This removes jitter while keeping the smoothed trajectory as the target.
-- When tracked points are lost because the video shifts, newly detected
-  keypoints are added for future frames, so they can participate in correction
-  once they become common with the previous frame.
+- Kornia's `KeyNetHardNet` detects Key.Net keypoints and computes HardNet
+  descriptors for every frame.
+- Consecutive frames are descriptor-matched with a mutual Lowe-ratio test.
+- A robust partial affine transform is estimated with RANSAC, giving per-frame
+  x shift, y shift, and small rotation.
+- These frame-to-frame transforms are accumulated into a raw camera trajectory.
+- The full trajectory is smoothed with a centered moving average
+  (`--smoothing-radius`; default radius 15, so a 31-frame window).
+- Each frame is warped by the difference between the smoothed trajectory and the
+  raw trajectory. This removes fast jitter while preserving slow intentional
+  motion.
+
+## Why not only average the past five frames?
+
+A causal average of only the past five frames often does **not** stabilize
+offline video well. It follows the jitter with lag, cannot use future context,
+and may leave the current frame close to the original shaky trajectory. A better
+offline approach is:
+
+1. Estimate the camera motion for the whole video.
+2. Smooth the whole trajectory.
+3. Warp each frame from the raw trajectory to the smoothed trajectory.
+
+If you specifically want a five-frame smoother, use a centered five-frame window:
+
+```bash
+python3 video_jitter_stabilizer.py input.mp4 --smoothing-radius 2
+```
+
+For stronger stabilization, increase the radius, for example:
+
+```bash
+python3 video_jitter_stabilizer.py input.mp4 --smoothing-radius 30
+```
 
 Useful options:
 
@@ -49,5 +69,13 @@ Useful options:
 python3 video_jitter_stabilizer.py --help
 ```
 
-If optical-flow arrows are still too short for a low-amplitude jitter video,
+If Key.Net motion arrows are still too short for a low-amplitude jitter video,
 increase `--flow-scale`, for example `--flow-scale 15`.
+
+Useful tuning options:
+
+- `--max-features`: more Key.Net features can improve matching on textured
+  videos.
+- `--match-ratio`: lower values make matching stricter.
+- `--ransac-threshold`: higher values tolerate noisier matches.
+- `--border-scale`: zooms the stabilized frame slightly to hide borders.

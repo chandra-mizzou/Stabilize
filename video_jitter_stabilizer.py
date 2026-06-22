@@ -1,35 +1,54 @@
 #!/usr/bin/env python3
-"""Analyze and reduce x/y video jitter with keypoints and optical flow.
+"""Analyze and stabilize x/y video jitter with Key.Net features.
 
-The first frame is used as the reference for the shift plot. For correction,
-the script tracks keypoints common with the previous frame, adds newly detected
-keypoints for future frames, and applies a rolling average of recent keypoint
-motion once enough history is available.
+This script uses Kornia's KeyNetHardNet feature extractor to detect Key.Net
+keypoints and HardNet descriptors. Consecutive frames are matched, a robust
+partial affine camera motion is estimated with RANSAC, the full camera
+trajectory is smoothed, and every frame is warped toward that smooth trajectory.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-from collections import deque
+import math
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import cv2
 import numpy as np
 
 
-DEFAULT_MAX_POINTS = 700
-DEFAULT_MIN_ACTIVE_POINTS = 120
-DEFAULT_ROLLING_WINDOW = 5
+DEFAULT_MAX_FEATURES = 1500
+DEFAULT_MIN_MATCHES = 12
+DEFAULT_SMOOTHING_RADIUS = 15
+
+
+@dataclass
+class FeatureSet:
+    points: np.ndarray
+    descriptors: np.ndarray
+
+
+@dataclass
+class MotionEstimate:
+    dx: float
+    dy: float
+    da: float
+    matched_prev: np.ndarray
+    matched_curr: np.ndarray
+    inlier_mask: np.ndarray
+    match_count: int
+    inlier_count: int
+    used_fallback: bool = False
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Read a video, plot first-frame-reference x/y keypoint shifts, "
-            "overlay optical-flow vectors, and write a four-quadrant jitter "
-            "analysis/stabilization video."
+            "Read a video, estimate Key.Net feature motion, plot x/y camera "
+            "shift, overlay feature-motion vectors, and write a stabilized "
+            "four-quadrant analysis video."
         )
     )
     parser.add_argument("input_video", type=Path, help="Path to the input video file.")
@@ -37,12 +56,17 @@ def parse_args() -> argparse.Namespace:
         "-o",
         "--output",
         type=Path,
-        help="Output four-quadrant video path. Defaults to '<input>_jitter_analysis.mp4'.",
+        help="Output four-quadrant video path. Defaults to '<input>_keynet_stabilized.mp4'.",
+    )
+    parser.add_argument(
+        "--stable-output",
+        type=Path,
+        help="Optional path for a stabilized-only video without quadrants.",
     )
     parser.add_argument(
         "--csv",
         type=Path,
-        help="Optional CSV path for frame_no, shift_x, shift_y, correction_x, correction_y.",
+        help="Optional CSV path for trajectory, smoothing, corrections, matches, and inliers.",
     )
     parser.add_argument(
         "--display",
@@ -50,61 +74,70 @@ def parse_args() -> argparse.Namespace:
         help="Show the four-quadrant video while processing. Press q to stop.",
     )
     parser.add_argument(
-        "--max-points",
+        "--max-features",
         type=int,
-        default=DEFAULT_MAX_POINTS,
-        help=f"Maximum active keypoints to keep for tracking (default: {DEFAULT_MAX_POINTS}).",
+        default=DEFAULT_MAX_FEATURES,
+        help=f"Maximum Key.Net features per frame (default: {DEFAULT_MAX_FEATURES}).",
     )
     parser.add_argument(
-        "--min-active-points",
+        "--feature-max-size",
         type=int,
-        default=DEFAULT_MIN_ACTIVE_POINTS,
+        default=960,
         help=(
-            "Refresh keypoints when active tracks drop below this count "
-            f"(default: {DEFAULT_MIN_ACTIVE_POINTS})."
+            "Resize the longest image side before Key.Net extraction for speed, "
+            "then scale keypoints back to full resolution (default: 960; use 0 to disable)."
         ),
     )
     parser.add_argument(
-        "--rolling-window",
+        "--match-ratio",
+        type=float,
+        default=0.80,
+        help="Lowe ratio threshold for HardNet descriptor matching (default: 0.80).",
+    )
+    parser.add_argument(
+        "--min-matches",
         type=int,
-        default=DEFAULT_ROLLING_WINDOW,
+        default=DEFAULT_MIN_MATCHES,
+        help=f"Minimum matches/inliers before trusting affine estimation (default: {DEFAULT_MIN_MATCHES}).",
+    )
+    parser.add_argument(
+        "--ransac-threshold",
+        type=float,
+        default=4.0,
+        help="RANSAC reprojection threshold in pixels (default: 4).",
+    )
+    parser.add_argument(
+        "--smoothing-radius",
+        type=int,
+        default=DEFAULT_SMOOTHING_RADIUS,
         help=(
-            "Number of previous frame-to-frame motions to average after enough "
-            f"history is available (default: {DEFAULT_ROLLING_WINDOW})."
+            "Centered trajectory smoothing radius in frames. The window is "
+            "2*radius+1 frames (default: 15). Use 2 for a five-frame centered window."
         ),
     )
     parser.add_argument(
-        "--quality-level",
+        "--border-scale",
         type=float,
-        default=0.01,
-        help="Shi-Tomasi keypoint quality level (default: 0.01).",
-    )
-    parser.add_argument(
-        "--min-distance",
-        type=float,
-        default=8.0,
-        help="Minimum distance between detected keypoints in pixels (default: 8).",
+        default=1.03,
+        help="Slight zoom applied to stabilized frames to hide borders (default: 1.03).",
     )
     parser.add_argument(
         "--vector-stride",
         type=int,
-        default=4,
-        help="Draw every Nth optical-flow vector to reduce clutter (default: 4).",
+        default=2,
+        help="Draw every Nth matched Key.Net motion vector to reduce clutter (default: 2).",
     )
     parser.add_argument(
         "--flow-scale",
         type=float,
-        default=8.0,
-        help=(
-            "Scale optical-flow vectors before drawing so small jitter remains "
-            "visible (default: 8)."
-        ),
+        default=4.0,
+        help="Scale feature-motion vectors before drawing (default: 4).",
     )
     parser.add_argument(
         "--flow-thickness",
         type=int,
         default=2,
-        help="Optical-flow vector line thickness in pixels (default: 2).",
+        help="Feature-motion vector line thickness in pixels (default: 2).",
     )
     parser.add_argument(
         "--plot-history",
@@ -112,182 +145,348 @@ def parse_args() -> argparse.Namespace:
         default=240,
         help="Number of recent frames shown in the shift quadrant (default: 240).",
     )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+        help="Device for Kornia Key.Net inference (default: auto).",
+    )
+    parser.add_argument(
+        "--no-status-text",
+        action="store_true",
+        help="Do not draw diagnostic text on overlay/stabilized panels.",
+    )
     return parser.parse_args()
 
 
-def detect_keypoints(
-    gray: np.ndarray,
-    max_points: int,
-    quality_level: float,
-    min_distance: float,
-    existing_points: np.ndarray | None = None,
-) -> np.ndarray:
-    """Detect Shi-Tomasi corners, optionally avoiding existing tracks."""
-    mask = np.full(gray.shape, 255, dtype=np.uint8)
-    if existing_points is not None and len(existing_points) > 0:
-        radius = max(2, int(min_distance))
-        for point in existing_points.reshape(-1, 2):
-            cv2.circle(mask, tuple(np.round(point).astype(int)), radius, 0, -1)
+class KeyNetHardNetExtractor:
+    """Small wrapper around Kornia's KeyNetHardNet local feature model."""
 
-    points = cv2.goodFeaturesToTrack(
-        gray,
-        maxCorners=max_points,
-        qualityLevel=quality_level,
-        minDistance=min_distance,
-        blockSize=7,
-        mask=mask,
-    )
-    if points is None:
-        return np.empty((0, 1, 2), dtype=np.float32)
-    return points.astype(np.float32)
+    def __init__(self, max_features: int, feature_max_size: int, device: str) -> None:
+        try:
+            import torch
+            import kornia.feature as kornia_feature
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "Key.Net support requires Kornia and PyTorch. Install dependencies with "
+                "`python3 -m pip install -r requirements.txt`."
+            ) from exc
+
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        self.torch = torch
+        self.kornia_feature = kornia_feature
+        self.device = torch.device(device)
+        self.feature_max_size = max(0, feature_max_size)
+        self.model = kornia_feature.KeyNetHardNet(
+            num_features=max_features,
+            upright=True,
+            device=self.device,
+        ).to(self.device)
+        self.model.eval()
+
+    def extract(self, frame: np.ndarray) -> FeatureSet:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        original_height, original_width = gray.shape[:2]
+        scale = 1.0
+        if self.feature_max_size > 0:
+            longest_side = max(original_height, original_width)
+            if longest_side > self.feature_max_size:
+                scale = self.feature_max_size / float(longest_side)
+                resized_width = max(1, int(round(original_width * scale)))
+                resized_height = max(1, int(round(original_height * scale)))
+                gray = cv2.resize(gray, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
+
+        tensor = self.torch.from_numpy(gray.astype(np.float32) / 255.0)
+        tensor = tensor[None, None].to(self.device)
+
+        with self.torch.inference_mode():
+            lafs, _responses, descriptors = self.model(tensor)
+            centers = self.kornia_feature.get_laf_center(lafs)[0]
+
+        points = centers.detach().cpu().numpy().astype(np.float32)
+        if scale != 1.0:
+            points /= scale
+
+        descriptors_np = descriptors[0].detach().cpu().numpy().astype(np.float32)
+        if len(points) == 0 or len(descriptors_np) == 0:
+            return FeatureSet(
+                points=np.empty((0, 2), dtype=np.float32),
+                descriptors=np.empty((0, 128), dtype=np.float32),
+            )
+        return FeatureSet(points=points, descriptors=descriptors_np)
 
 
-def refresh_keypoints(
-    gray: np.ndarray,
-    current_points: np.ndarray,
-    max_points: int,
-    min_active_points: int,
-    quality_level: float,
-    min_distance: float,
-) -> np.ndarray:
-    """Add newly visible keypoints for future optical-flow corrections."""
-    if len(current_points) >= max_points or len(current_points) >= min_active_points:
-        return current_points
-
-    needed = max_points - len(current_points)
-    new_points = detect_keypoints(
-        gray,
-        max_points=needed,
-        quality_level=quality_level,
-        min_distance=min_distance,
-        existing_points=current_points,
-    )
-    if len(new_points) == 0:
-        return current_points
-    if len(current_points) == 0:
-        return new_points
-    return np.concatenate([current_points.astype(np.float32), new_points], axis=0)
-
-
-def track_points(
-    previous_gray: np.ndarray,
-    current_gray: np.ndarray,
-    previous_points: np.ndarray,
+def match_features(
+    previous: FeatureSet,
+    current: FeatureSet,
+    ratio: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Track points with pyramidal Lucas-Kanade optical flow."""
-    if previous_points is None or len(previous_points) == 0:
-        empty = np.empty((0, 1, 2), dtype=np.float32)
+    """Match HardNet descriptors with a mutual Lowe-ratio test."""
+    if len(previous.points) < 2 or len(current.points) < 2:
+        empty = np.empty((0, 2), dtype=np.float32)
         return empty, empty
 
-    next_points, status, _error = cv2.calcOpticalFlowPyrLK(
-        previous_gray,
-        current_gray,
-        previous_points,
-        None,
-        winSize=(21, 21),
-        maxLevel=3,
-        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+    matcher = cv2.BFMatcher(cv2.NORM_L2)
+    forward = matcher.knnMatch(previous.descriptors, current.descriptors, k=2)
+    backward = matcher.knnMatch(current.descriptors, previous.descriptors, k=2)
+
+    ratio = float(np.clip(ratio, 0.01, 1.0))
+    forward_good: dict[int, int] = {}
+    for pair in forward:
+        if len(pair) == 2 and pair[0].distance < ratio * pair[1].distance:
+            forward_good[pair[0].queryIdx] = pair[0].trainIdx
+
+    backward_good: dict[int, int] = {}
+    for pair in backward:
+        if len(pair) == 2 and pair[0].distance < ratio * pair[1].distance:
+            backward_good[pair[0].queryIdx] = pair[0].trainIdx
+
+    matched_prev: list[np.ndarray] = []
+    matched_curr: list[np.ndarray] = []
+    for prev_idx, curr_idx in forward_good.items():
+        if backward_good.get(curr_idx) == prev_idx:
+            matched_prev.append(previous.points[prev_idx])
+            matched_curr.append(current.points[curr_idx])
+
+    if not matched_prev:
+        empty = np.empty((0, 2), dtype=np.float32)
+        return empty, empty
+    return np.asarray(matched_prev, dtype=np.float32), np.asarray(matched_curr, dtype=np.float32)
+
+
+def decompose_affine(transform: np.ndarray) -> tuple[float, float, float]:
+    """Return dx, dy, and rotation angle from a 2x3 partial affine transform."""
+    dx = float(transform[0, 2])
+    dy = float(transform[1, 2])
+    da = float(math.atan2(transform[1, 0], transform[0, 0]))
+    return dx, dy, da
+
+
+def estimate_motion(
+    matched_prev: np.ndarray,
+    matched_curr: np.ndarray,
+    min_matches: int,
+    ransac_threshold: float,
+) -> MotionEstimate:
+    match_count = int(len(matched_prev))
+    empty_mask = np.zeros(match_count, dtype=bool)
+    if match_count < min_matches:
+        return MotionEstimate(0.0, 0.0, 0.0, matched_prev, matched_curr, empty_mask, match_count, 0, True)
+
+    transform, inliers = cv2.estimateAffinePartial2D(
+        matched_prev,
+        matched_curr,
+        method=cv2.RANSAC,
+        ransacReprojThreshold=ransac_threshold,
+        maxIters=3000,
+        confidence=0.995,
+        refineIters=10,
     )
-    if next_points is None or status is None:
-        empty = np.empty((0, 1, 2), dtype=np.float32)
-        return empty, empty
+    if transform is None or inliers is None:
+        delta = np.median(matched_curr - matched_prev, axis=0)
+        return MotionEstimate(
+            float(delta[0]),
+            float(delta[1]),
+            0.0,
+            matched_prev,
+            matched_curr,
+            empty_mask,
+            match_count,
+            0,
+            True,
+        )
 
-    good = status.reshape(-1).astype(bool)
-    return previous_points[good].reshape(-1, 1, 2), next_points[good].reshape(-1, 1, 2)
+    inlier_mask = inliers.reshape(-1).astype(bool)
+    inlier_count = int(np.sum(inlier_mask))
+    if inlier_count < min_matches:
+        if match_count > 0:
+            delta = np.median(matched_curr - matched_prev, axis=0)
+            return MotionEstimate(
+                float(delta[0]),
+                float(delta[1]),
+                0.0,
+                matched_prev,
+                matched_curr,
+                inlier_mask,
+                match_count,
+                inlier_count,
+                True,
+            )
+        return MotionEstimate(0.0, 0.0, 0.0, matched_prev, matched_curr, inlier_mask, match_count, 0, True)
 
-
-def track_reference_points(
-    previous_gray: np.ndarray,
-    current_gray: np.ndarray,
-    reference_initial_points: np.ndarray,
-    reference_previous_points: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Track first-frame reference points while keeping original pairings."""
-    if len(reference_previous_points) == 0:
-        empty = np.empty((0, 1, 2), dtype=np.float32)
-        return empty, empty
-
-    next_points, status, _error = cv2.calcOpticalFlowPyrLK(
-        previous_gray,
-        current_gray,
-        reference_previous_points,
-        None,
-        winSize=(21, 21),
-        maxLevel=3,
-        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
-    )
-    if next_points is None or status is None:
-        empty = np.empty((0, 1, 2), dtype=np.float32)
-        return empty, empty
-
-    good = status.reshape(-1).astype(bool)
-    return reference_initial_points[good].reshape(-1, 1, 2), next_points[good].reshape(-1, 1, 2)
-
-
-def mean_delta(previous_points: np.ndarray, current_points: np.ndarray) -> np.ndarray:
-    """Return mean dx/dy between two same-length point arrays."""
-    if len(previous_points) == 0 or len(current_points) == 0:
-        return np.zeros(2, dtype=np.float32)
-    deltas = current_points.reshape(-1, 2) - previous_points.reshape(-1, 2)
-    return np.mean(deltas, axis=0).astype(np.float32)
+    dx, dy, da = decompose_affine(transform)
+    return MotionEstimate(dx, dy, da, matched_prev, matched_curr, inlier_mask, match_count, inlier_count)
 
 
-def moving_average(values: Iterable[np.ndarray]) -> np.ndarray:
-    stacked = np.asarray(list(values), dtype=np.float32)
-    if stacked.size == 0:
-        return np.zeros(2, dtype=np.float32)
-    return np.mean(stacked, axis=0).astype(np.float32)
+def centered_moving_average(trajectory: np.ndarray, radius: int) -> np.ndarray:
+    """Smooth a trajectory with a centered moving average and edge clipping."""
+    if len(trajectory) == 0:
+        return trajectory.copy()
+    radius = max(0, int(radius))
+    if radius == 0:
+        return trajectory.copy()
+
+    smoothed = np.empty_like(trajectory, dtype=np.float32)
+    for index in range(len(trajectory)):
+        start = max(0, index - radius)
+        end = min(len(trajectory), index + radius + 1)
+        smoothed[index] = np.mean(trajectory[start:end], axis=0)
+    return smoothed
 
 
-def draw_flow_vectors(
+def estimate_video_motion(
+    input_path: Path,
+    extractor: KeyNetHardNetExtractor,
+    args: argparse.Namespace,
+) -> tuple[np.ndarray, np.ndarray, list[MotionEstimate], float, tuple[int, int]]:
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {input_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0 or not np.isfinite(fps):
+        fps = 30.0
+
+    success, previous_frame = cap.read()
+    if not success:
+        raise RuntimeError(f"Could not read the first frame from: {input_path}")
+
+    height, width = previous_frame.shape[:2]
+    previous_features = extractor.extract(previous_frame)
+
+    transforms = [np.zeros(3, dtype=np.float32)]
+    motions = [
+        MotionEstimate(
+            0.0,
+            0.0,
+            0.0,
+            np.empty((0, 2), dtype=np.float32),
+            np.empty((0, 2), dtype=np.float32),
+            np.empty((0,), dtype=bool),
+            0,
+            0,
+            False,
+        )
+    ]
+
+    frame_no = 1
+    while True:
+        success, frame = cap.read()
+        if not success:
+            break
+        frame_no += 1
+        current_features = extractor.extract(frame)
+        matched_prev, matched_curr = match_features(previous_features, current_features, args.match_ratio)
+        motion = estimate_motion(matched_prev, matched_curr, args.min_matches, args.ransac_threshold)
+        transforms.append(np.array([motion.dx, motion.dy, motion.da], dtype=np.float32))
+        motions.append(motion)
+        previous_features = current_features
+        print(
+            f"estimated frame {frame_no}: matches={motion.match_count}, "
+            f"inliers={motion.inlier_count}, dx={motion.dx:.2f}, dy={motion.dy:.2f}, "
+            f"da={math.degrees(motion.da):.3f} deg"
+        )
+
+    cap.release()
+    transforms_np = np.asarray(transforms, dtype=np.float32)
+    trajectory = np.cumsum(transforms_np, axis=0)
+    return transforms_np, trajectory, motions, fps, (width, height)
+
+
+def correction_matrix(
+    correction: np.ndarray,
+    width: int,
+    height: int,
+    border_scale: float,
+) -> np.ndarray:
+    """Build a correction warp around the frame center."""
+    dx, dy, da = [float(value) for value in correction]
+    center = (width / 2.0, height / 2.0)
+    matrix = cv2.getRotationMatrix2D(center, math.degrees(da), max(1.0, float(border_scale)))
+    matrix[0, 2] += dx
+    matrix[1, 2] += dy
+    return matrix.astype(np.float32)
+
+
+def stabilize_frame(
     frame: np.ndarray,
-    previous_points: np.ndarray,
-    current_points: np.ndarray,
+    correction: np.ndarray,
+    border_scale: float,
+) -> np.ndarray:
+    height, width = frame.shape[:2]
+    matrix = correction_matrix(correction, width, height, border_scale)
+    return cv2.warpAffine(
+        frame,
+        matrix,
+        (width, height),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+
+def draw_feature_vectors(
+    frame: np.ndarray,
+    motion: MotionEstimate,
     stride: int,
     scale: float,
     thickness: int,
+    show_status: bool,
 ) -> np.ndarray:
-    """Overlay optical-flow direction vectors on a frame."""
     overlay = frame.copy()
-    points_prev = previous_points.reshape(-1, 2)
-    points_curr = current_points.reshape(-1, 2)
-    stride = max(1, stride)
-    scale = max(1.0, scale)
-    thickness = max(1, thickness)
-    deltas = points_curr - points_prev
-    average_motion = np.mean(deltas, axis=0) if len(deltas) > 0 else np.zeros(2, dtype=np.float32)
+    stride = max(1, int(stride))
+    scale = max(1.0, float(scale))
+    thickness = max(1, int(thickness))
 
-    for curr, delta in zip(points_curr[::stride], deltas[::stride]):
-        # Anchor vectors on the current feature location and scale the direction
-        # so low-amplitude camera jitter is visible in the output video.
-        p0 = tuple(np.round(curr).astype(int))
-        p1 = tuple(np.round(curr + delta * scale).astype(int))
-        cv2.arrowedLine(overlay, p0, p1, (0, 0, 0), thickness + 2, tipLength=0.35)
-        cv2.arrowedLine(overlay, p0, p1, (0, 255, 255), thickness, tipLength=0.35)
-        cv2.circle(overlay, p0, thickness + 1, (0, 80, 255), -1)
+    if len(motion.matched_curr) > 0:
+        inlier_mask = motion.inlier_mask
+        if len(inlier_mask) != len(motion.matched_curr):
+            inlier_mask = np.ones(len(motion.matched_curr), dtype=bool)
+        for prev, curr, is_inlier in zip(
+            motion.matched_prev[::stride],
+            motion.matched_curr[::stride],
+            inlier_mask[::stride],
+        ):
+            delta = curr - prev
+            p0 = tuple(np.round(curr).astype(int))
+            p1 = tuple(np.round(curr + delta * scale).astype(int))
+            color = (0, 255, 255) if is_inlier else (80, 80, 255)
+            cv2.arrowedLine(overlay, p0, p1, (0, 0, 0), thickness + 2, tipLength=0.35)
+            cv2.arrowedLine(overlay, p0, p1, color, thickness, tipLength=0.35)
+            cv2.circle(overlay, p0, thickness + 1, (0, 80, 255), -1)
 
-    cv2.putText(
-        overlay,
-        f"Optical flow: {len(points_curr)} pts, avg dx={average_motion[0]:.2f}, dy={average_motion[1]:.2f}",
-        (12, 28),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (0, 255, 255),
-        2,
-        cv2.LINE_AA,
-    )
+    if show_status:
+        fallback = " median fallback" if motion.used_fallback else ""
+        draw_text_lines(
+            overlay,
+            [
+                f"Key.Net-HardNet matches: {motion.match_count}, inliers: {motion.inlier_count}{fallback}",
+                f"motion dx={motion.dx:.2f}, dy={motion.dy:.2f}, rot={math.degrees(motion.da):.3f} deg",
+            ],
+            origin_y=58,
+        )
     return overlay
+
+
+def draw_text_lines(frame: np.ndarray, lines: list[str], origin_y: int = 64) -> np.ndarray:
+    for index, line in enumerate(lines):
+        y = origin_y + index * 24
+        cv2.putText(frame, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(frame, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
+    return frame
 
 
 def draw_shift_plot(
     width: int,
     height: int,
     frame_numbers: list[int],
-    shifts_x: list[float],
-    shifts_y: list[float],
+    raw_x: list[float],
+    raw_y: list[float],
+    smooth_x: list[float],
+    smooth_y: list[float],
     history: int,
 ) -> np.ndarray:
-    """Draw x/y shift traces in pixels for use as a video quadrant."""
     plot = np.full((height, width, 3), 245, dtype=np.uint8)
     margin_left = 58
     margin_right = 16
@@ -299,7 +498,7 @@ def draw_shift_plot(
     cv2.rectangle(plot, (x0, y1), (x1, y0), (35, 35, 35), 1)
     cv2.putText(
         plot,
-        "3. Shift wrt first-frame keypoints",
+        "3. Key.Net camera shift trajectory",
         (16, 24),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.65,
@@ -312,17 +511,19 @@ def draw_shift_plot(
         return plot
 
     recent_frames = frame_numbers[-history:]
-    recent_x = np.asarray(shifts_x[-history:], dtype=np.float32)
-    recent_y = np.asarray(shifts_y[-history:], dtype=np.float32)
-    valid = np.isfinite(recent_x) & np.isfinite(recent_y)
-    if not np.any(valid):
+    series = [
+        np.asarray(raw_x[-history:], dtype=np.float32),
+        np.asarray(raw_y[-history:], dtype=np.float32),
+        np.asarray(smooth_x[-history:], dtype=np.float32),
+        np.asarray(smooth_y[-history:], dtype=np.float32),
+    ]
+    valid_values = np.concatenate([values[np.isfinite(values)] for values in series if np.any(np.isfinite(values))])
+    if len(valid_values) == 0:
         return plot
 
-    max_abs = float(np.nanmax(np.abs(np.concatenate([recent_x[valid], recent_y[valid]]))))
-    max_abs = max(1.0, max_abs)
+    max_abs = max(1.0, float(np.nanmax(np.abs(valid_values))))
     y_mid = int(round((y0 + y1) / 2.0))
     cv2.line(plot, (x0, y_mid), (x1, y_mid), (190, 190, 190), 1)
-
     cv2.putText(plot, f"+{max_abs:.1f}px", (6, y1 + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (70, 70, 70), 1)
     cv2.putText(plot, "0", (30, y_mid + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (70, 70, 70), 1)
     cv2.putText(plot, f"-{max_abs:.1f}px", (6, y0 + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (70, 70, 70), 1)
@@ -335,41 +536,33 @@ def draw_shift_plot(
         y = y_mid - int(round(value / max_abs * ((y0 - y1) / 2.0)))
         return x, int(np.clip(y, y1, y0))
 
-    def draw_trace(values: np.ndarray, color: tuple[int, int, int]) -> None:
-        points: list[tuple[int, int]] = []
-        for frame_no, value in zip(recent_frames, values):
-            if np.isfinite(value):
-                points.append(to_screen(frame_no, float(value)))
-        for start, end in zip(points, points[1:]):
-            cv2.line(plot, start, end, color, 2, cv2.LINE_AA)
+    def draw_trace(values: np.ndarray, color: tuple[int, int, int], dotted: bool = False) -> None:
+        points = [
+            to_screen(frame_no, float(value))
+            for frame_no, value in zip(recent_frames, values)
+            if np.isfinite(value)
+        ]
+        for segment_no, (start, end) in enumerate(zip(points, points[1:])):
+            if not dotted or segment_no % 2 == 0:
+                cv2.line(plot, start, end, color, 2, cv2.LINE_AA)
 
-    draw_trace(recent_x, (30, 80, 230))
-    draw_trace(recent_y, (30, 170, 30))
-    cv2.putText(plot, "x shift", (x0 + 8, y0 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (30, 80, 230), 2)
-    cv2.putText(plot, "y shift", (x0 + 100, y0 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (30, 170, 30), 2)
+    draw_trace(series[0], (30, 80, 230))
+    draw_trace(series[1], (30, 170, 30))
+    draw_trace(series[2], (120, 150, 255), dotted=True)
+    draw_trace(series[3], (120, 220, 120), dotted=True)
+
+    cv2.putText(plot, "raw x/y", (x0 + 8, y0 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (30, 80, 230), 2)
+    cv2.putText(plot, "smooth x/y", (x0 + 105, y0 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (90, 150, 90), 2)
     cv2.putText(
         plot,
         f"frames {frame_min}-{recent_frames[-1]}",
-        (max(x0 + 190, x1 - 170), y0 + 30),
+        (max(x0 + 235, x1 - 170), y0 + 30),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.48,
         (70, 70, 70),
         1,
     )
     return plot
-
-
-def translate_frame(frame: np.ndarray, shift: np.ndarray) -> np.ndarray:
-    """Warp a frame by the negative cumulative shift to stabilize it."""
-    dx, dy = float(shift[0]), float(shift[1])
-    transform = np.array([[1.0, 0.0, -dx], [0.0, 1.0, -dy]], dtype=np.float32)
-    return cv2.warpAffine(
-        frame,
-        transform,
-        (frame.shape[1], frame.shape[0]),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REPLICATE,
-    )
 
 
 def label_panel(frame: np.ndarray, title: str) -> np.ndarray:
@@ -388,204 +581,214 @@ def label_panel(frame: np.ndarray, title: str) -> np.ndarray:
     return labeled
 
 
-def draw_status_text(frame: np.ndarray, lines: list[str], origin_y: int = 64) -> np.ndarray:
-    """Draw high-contrast status text below a panel title."""
-    output = frame.copy()
-    for index, line in enumerate(lines):
-        y = origin_y + index * 24
-        cv2.putText(output, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(output, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
-    return output
-
-
 def make_four_panel(
     original: np.ndarray,
     flow: np.ndarray,
     plot: np.ndarray,
     stabilized: np.ndarray,
 ) -> np.ndarray:
-    top = np.hstack([label_panel(original, "1. Original video"), label_panel(flow, "2. Optical flow overlay")])
-    bottom = np.hstack([plot, label_panel(stabilized, "4. Jitter corrected stable video")])
+    top = np.hstack([label_panel(original, "1. Original video"), label_panel(flow, "2. Key.Net motion overlay")])
+    bottom = np.hstack([plot, label_panel(stabilized, "4. Affine trajectory stabilized video")])
     return np.vstack([top, bottom])
 
 
-def write_shift_csv(
+def write_csv(
     path: Path,
-    frame_numbers: list[int],
-    shifts_x: list[float],
-    shifts_y: list[float],
-    corrections_x: list[float],
-    corrections_y: list[float],
+    trajectory: np.ndarray,
+    smoothed: np.ndarray,
+    corrections: np.ndarray,
+    motions: list[MotionEstimate],
 ) -> None:
     with path.open("w", newline="") as csv_file:
         writer = csv.writer(csv_file)
-        writer.writerow(["frame_no", "shift_x_px", "shift_y_px", "correction_x_px", "correction_y_px"])
-        writer.writerows(zip(frame_numbers, shifts_x, shifts_y, corrections_x, corrections_y))
+        writer.writerow(
+            [
+                "frame_no",
+                "raw_shift_x_px",
+                "raw_shift_y_px",
+                "raw_angle_deg",
+                "smooth_shift_x_px",
+                "smooth_shift_y_px",
+                "smooth_angle_deg",
+                "correction_x_px",
+                "correction_y_px",
+                "correction_angle_deg",
+                "matches",
+                "inliers",
+                "used_fallback",
+            ]
+        )
+        for index, (raw, smooth, correction, motion) in enumerate(
+            zip(trajectory, smoothed, corrections, motions),
+            start=1,
+        ):
+            writer.writerow(
+                [
+                    index,
+                    float(raw[0]),
+                    float(raw[1]),
+                    math.degrees(float(raw[2])),
+                    float(smooth[0]),
+                    float(smooth[1]),
+                    math.degrees(float(smooth[2])),
+                    float(correction[0]),
+                    float(correction[1]),
+                    math.degrees(float(correction[2])),
+                    motion.match_count,
+                    motion.inlier_count,
+                    int(motion.used_fallback),
+                ]
+            )
 
 
-def process_video(args: argparse.Namespace) -> None:
-    input_path = args.input_video
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input video does not exist: {input_path}")
-    if args.rolling_window < 1:
-        raise ValueError("--rolling-window must be at least 1")
-    if args.max_points < 1:
-        raise ValueError("--max-points must be at least 1")
-
-    output_path = args.output or input_path.with_name(f"{input_path.stem}_jitter_analysis.mp4")
+def write_outputs(
+    input_path: Path,
+    output_path: Path,
+    stable_output_path: Path | None,
+    fps: float,
+    frame_size: tuple[int, int],
+    trajectory: np.ndarray,
+    smoothed: np.ndarray,
+    corrections: np.ndarray,
+    motions: list[MotionEstimate],
+    args: argparse.Namespace,
+) -> None:
+    width, height = frame_size
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {input_path}")
+        raise RuntimeError(f"Could not reopen video for output: {input_path}")
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0 or not np.isfinite(fps):
-        fps = 30.0
-
-    success, first_frame = cap.read()
-    if not success:
-        raise RuntimeError(f"Could not read the first frame from: {input_path}")
-
-    height, width = first_frame.shape[:2]
-    writer = cv2.VideoWriter(
+    panel_writer = cv2.VideoWriter(
         str(output_path),
         cv2.VideoWriter_fourcc(*"mp4v"),
         fps,
         (width * 2, height * 2),
     )
-    if not writer.isOpened():
+    if not panel_writer.isOpened():
         raise RuntimeError(f"Could not open output writer: {output_path}")
 
-    previous_gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
-    active_points = detect_keypoints(
-        previous_gray,
-        max_points=args.max_points,
-        quality_level=args.quality_level,
-        min_distance=args.min_distance,
-    )
-    if len(active_points) == 0:
-        raise RuntimeError("No keypoints detected in the first frame.")
+    stable_writer = None
+    if stable_output_path is not None:
+        stable_writer = cv2.VideoWriter(
+            str(stable_output_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (width, height),
+        )
+        if not stable_writer.isOpened():
+            raise RuntimeError(f"Could not open stabilized-only writer: {stable_output_path}")
 
-    # A separate first-frame-reference track is kept only for the requested plot.
-    reference_initial_points = active_points.copy()
-    reference_previous_points = active_points.copy()
+    frame_numbers: list[int] = []
+    raw_x: list[float] = []
+    raw_y: list[float] = []
+    smooth_x: list[float] = []
+    smooth_y: list[float] = []
 
-    frame_numbers = [1]
-    shifts_x = [0.0]
-    shifts_y = [0.0]
-    corrections_x = [0.0]
-    corrections_y = [0.0]
-    raw_shift_history: deque[np.ndarray] = deque(maxlen=args.rolling_window)
-    raw_shift_estimate = np.zeros(2, dtype=np.float32)
-    applied_correction = np.zeros(2, dtype=np.float32)
-
-    first_plot = draw_shift_plot(width, height, frame_numbers, shifts_x, shifts_y, args.plot_history)
-    first_flow = draw_status_text(first_frame, ["Reference frame: optical flow starts on frame 2"])
-    first_stabilized = draw_status_text(first_frame, ["Reference frame: no correction applied"])
-    first_panel = make_four_panel(first_frame, first_flow, first_plot, first_stabilized)
-    writer.write(first_panel)
-
-    if args.display:
-        cv2.imshow("video jitter analysis", first_panel)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            cap.release()
-            writer.release()
-            return
-
-    frame_no = 1
+    frame_index = 0
     while True:
         success, frame = cap.read()
         if not success:
             break
-        frame_no += 1
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if frame_index >= len(corrections):
+            break
 
-        common_previous, common_current = track_points(previous_gray, gray, active_points)
-        instant_motion = mean_delta(common_previous, common_current)
-        raw_shift_estimate += instant_motion
-        raw_shift_history.append(raw_shift_estimate.copy())
-        if len(raw_shift_history) >= args.rolling_window:
-            smoothed_shift = moving_average(raw_shift_history)
-            applied_correction = raw_shift_estimate - smoothed_shift
-        else:
-            smoothed_shift = np.zeros(2, dtype=np.float32)
-            applied_correction = raw_shift_estimate.copy()
+        correction = corrections[frame_index]
+        stabilized = stabilize_frame(frame, correction, args.border_scale)
+        if stable_writer is not None:
+            stable_writer.write(stabilized)
 
-        ref_initial_common, ref_current_common = track_reference_points(
-            previous_gray,
-            gray,
-            reference_initial_points,
-            reference_previous_points,
-        )
-        if len(ref_current_common) > 0:
-            reference_initial_points = ref_initial_common
-            reference_previous_points = ref_current_common
-            shift = mean_delta(reference_initial_points, ref_current_common)
-        else:
-            shift = np.array([np.nan, np.nan], dtype=np.float32)
-            reference_previous_points = np.empty((0, 1, 2), dtype=np.float32)
-            reference_initial_points = np.empty((0, 1, 2), dtype=np.float32)
-
-        stabilized = translate_frame(frame, applied_correction)
-        stabilized = draw_status_text(
-            stabilized,
-            [
-                f"raw shift dx={raw_shift_estimate[0]:.2f}, dy={raw_shift_estimate[1]:.2f}",
-                f"5-frame avg dx={smoothed_shift[0]:.2f}, dy={smoothed_shift[1]:.2f}",
-                f"applied correction dx={applied_correction[0]:.2f}, dy={applied_correction[1]:.2f}",
-            ],
-        )
-        flow = draw_flow_vectors(
+        motion = motions[frame_index]
+        flow = draw_feature_vectors(
             frame,
-            common_previous,
-            common_current,
+            motion,
             args.vector_stride,
             args.flow_scale,
             args.flow_thickness,
-        )
-        active_points = refresh_keypoints(
-            gray,
-            common_current,
-            max_points=args.max_points,
-            min_active_points=args.min_active_points,
-            quality_level=args.quality_level,
-            min_distance=args.min_distance,
+            not args.no_status_text,
         )
 
-        frame_numbers.append(frame_no)
-        shifts_x.append(float(shift[0]))
-        shifts_y.append(float(shift[1]))
-        corrections_x.append(float(applied_correction[0]))
-        corrections_y.append(float(applied_correction[1]))
+        frame_numbers.append(frame_index + 1)
+        raw_x.append(float(trajectory[frame_index, 0]))
+        raw_y.append(float(trajectory[frame_index, 1]))
+        smooth_x.append(float(smoothed[frame_index, 0]))
+        smooth_y.append(float(smoothed[frame_index, 1]))
+        plot = draw_shift_plot(
+            width,
+            height,
+            frame_numbers,
+            raw_x,
+            raw_y,
+            smooth_x,
+            smooth_y,
+            args.plot_history,
+        )
 
-        plot = draw_shift_plot(width, height, frame_numbers, shifts_x, shifts_y, args.plot_history)
+        if not args.no_status_text:
+            draw_text_lines(
+                stabilized,
+                [
+                    f"raw dx={trajectory[frame_index, 0]:.2f}, dy={trajectory[frame_index, 1]:.2f}",
+                    f"smooth dx={smoothed[frame_index, 0]:.2f}, dy={smoothed[frame_index, 1]:.2f}",
+                    f"correction dx={correction[0]:.2f}, dy={correction[1]:.2f}, rot={math.degrees(correction[2]):.3f} deg",
+                ],
+                origin_y=58,
+            )
+
         panel = make_four_panel(frame, flow, plot, stabilized)
-        writer.write(panel)
+        panel_writer.write(panel)
 
         if args.display:
             cv2.imshow("video jitter analysis", panel)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
-        previous_gray = gray
-
-        if len(active_points) == 0:
-            active_points = detect_keypoints(
-                gray,
-                max_points=args.max_points,
-                quality_level=args.quality_level,
-                min_distance=args.min_distance,
-            )
+        frame_index += 1
 
     cap.release()
-    writer.release()
+    panel_writer.release()
+    if stable_writer is not None:
+        stable_writer.release()
     if args.display:
         cv2.destroyAllWindows()
-    if args.csv:
-        write_shift_csv(args.csv, frame_numbers, shifts_x, shifts_y, corrections_x, corrections_y)
 
-    print(f"Wrote four-quadrant analysis video: {output_path}")
+
+def process_video(args: argparse.Namespace) -> None:
+    if not args.input_video.exists():
+        raise FileNotFoundError(f"Input video does not exist: {args.input_video}")
+    if args.max_features < 1:
+        raise ValueError("--max-features must be at least 1")
+    if args.smoothing_radius < 0:
+        raise ValueError("--smoothing-radius must be non-negative")
+    if args.border_scale < 1.0:
+        raise ValueError("--border-scale must be at least 1.0")
+
+    output_path = args.output or args.input_video.with_name(f"{args.input_video.stem}_keynet_stabilized.mp4")
+    extractor = KeyNetHardNetExtractor(args.max_features, args.feature_max_size, args.device)
+
+    transforms, trajectory, motions, fps, frame_size = estimate_video_motion(args.input_video, extractor, args)
+    smoothed = centered_moving_average(trajectory, args.smoothing_radius)
+    corrections = smoothed - trajectory
+
+    write_outputs(
+        args.input_video,
+        output_path,
+        args.stable_output,
+        fps,
+        frame_size,
+        trajectory,
+        smoothed,
+        corrections,
+        motions,
+        args,
+    )
     if args.csv:
-        print(f"Wrote shift/correction CSV: {args.csv}")
+        write_csv(args.csv, trajectory, smoothed, corrections, motions)
+
+    print(f"Wrote four-quadrant Key.Net stabilization video: {output_path}")
+    if args.stable_output:
+        print(f"Wrote stabilized-only video: {args.stable_output}")
+    if args.csv:
+        print(f"Wrote trajectory CSV: {args.csv}")
 
 
 def main() -> None:
