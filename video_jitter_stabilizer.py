@@ -23,6 +23,7 @@ DEFAULT_MAX_FEATURES = 1500
 DEFAULT_MIN_MATCHES = 12
 DEFAULT_SMOOTHING_RADIUS = 15
 DEFAULT_NUM_FRAMES = 100
+DEFAULT_STABILIZATION_MODE = "frame-to-frame"
 
 
 @dataclass
@@ -123,6 +124,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Centered trajectory smoothing radius in frames. The window is "
             "2*radius+1 frames (default: 15). Use 2 for a five-frame centered window."
+        ),
+    )
+    parser.add_argument(
+        "--stabilization-mode",
+        choices=["frame-to-frame", "smooth-trajectory"],
+        default=DEFAULT_STABILIZATION_MODE,
+        help=(
+            "Correction strategy. 'frame-to-frame' accumulates the measured x/y "
+            "shift and aligns every frame back to frame 1; 'smooth-trajectory' "
+            "warps to a smoothed camera path (default: frame-to-frame)."
         ),
     )
     parser.add_argument(
@@ -266,20 +277,18 @@ def match_features(
     return np.asarray(matched_prev, dtype=np.float32), np.asarray(matched_curr, dtype=np.float32)
 
 
-def decompose_affine(transform: np.ndarray) -> tuple[float, float, float]:
-    """Return dx, dy, and rotation angle from a 2x3 partial affine transform."""
-    dx = float(transform[0, 2])
-    dy = float(transform[1, 2])
-    da = float(math.atan2(transform[1, 0], transform[0, 0]))
-    return dx, dy, da
-
-
 def estimate_motion(
     matched_prev: np.ndarray,
     matched_curr: np.ndarray,
     min_matches: int,
     ransac_threshold: float,
 ) -> MotionEstimate:
+    """Estimate x/y camera translation between adjacent frames.
+
+    The user's jitter model is azimuth/elevation only, so the stabilizer ignores
+    rotation and scale. RANSAC is used only to reject bad matches; the final
+    motion is the median x/y displacement of inlier Key.Net matches.
+    """
     match_count = int(len(matched_prev))
     empty_mask = np.zeros(match_count, dtype=bool)
     if match_count < min_matches:
@@ -294,8 +303,9 @@ def estimate_motion(
         confidence=0.995,
         refineIters=10,
     )
+    deltas = matched_curr - matched_prev
     if transform is None or inliers is None:
-        delta = np.median(matched_curr - matched_prev, axis=0)
+        delta = np.median(deltas, axis=0)
         return MotionEstimate(
             float(delta[0]),
             float(delta[1]),
@@ -312,7 +322,7 @@ def estimate_motion(
     inlier_count = int(np.sum(inlier_mask))
     if inlier_count < min_matches:
         if match_count > 0:
-            delta = np.median(matched_curr - matched_prev, axis=0)
+            delta = np.median(deltas, axis=0)
             return MotionEstimate(
                 float(delta[0]),
                 float(delta[1]),
@@ -326,8 +336,17 @@ def estimate_motion(
             )
         return MotionEstimate(0.0, 0.0, 0.0, matched_prev, matched_curr, inlier_mask, match_count, 0, True)
 
-    dx, dy, da = decompose_affine(transform)
-    return MotionEstimate(dx, dy, da, matched_prev, matched_curr, inlier_mask, match_count, inlier_count)
+    inlier_delta = np.median(deltas[inlier_mask], axis=0)
+    return MotionEstimate(
+        float(inlier_delta[0]),
+        float(inlier_delta[1]),
+        0.0,
+        matched_prev,
+        matched_curr,
+        inlier_mask,
+        match_count,
+        inlier_count,
+    )
 
 
 def centered_moving_average(trajectory: np.ndarray, radius: int) -> np.ndarray:
@@ -397,7 +416,7 @@ def estimate_video_motion(
         print(
             f"estimated frame {frame_no}: matches={motion.match_count}, "
             f"inliers={motion.inlier_count}, dx={motion.dx:.2f}, dy={motion.dy:.2f}, "
-            f"da={math.degrees(motion.da):.3f} deg"
+            "translation-only"
         )
 
     cap.release()
@@ -474,7 +493,7 @@ def draw_feature_vectors(
             overlay,
             [
                 f"Key.Net-HardNet matches: {motion.match_count}, inliers: {motion.inlier_count}{fallback}",
-                f"motion dx={motion.dx:.2f}, dy={motion.dy:.2f}, rot={math.degrees(motion.da):.3f} deg",
+                f"translation dx={motion.dx:.2f}, dy={motion.dy:.2f}",
             ],
             origin_y=58,
         )
@@ -495,8 +514,8 @@ def draw_shift_plot(
     frame_numbers: list[int],
     raw_x: list[float],
     raw_y: list[float],
-    smooth_x: list[float],
-    smooth_y: list[float],
+    target_x: list[float],
+    target_y: list[float],
     history: int,
 ) -> np.ndarray:
     plot = np.full((height, width, 3), 245, dtype=np.uint8)
@@ -510,7 +529,7 @@ def draw_shift_plot(
     cv2.rectangle(plot, (x0, y1), (x1, y0), (35, 35, 35), 1)
     cv2.putText(
         plot,
-        "3. Key.Net camera shift trajectory",
+        "3. Key.Net x/y shift correction",
         (16, 24),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.65,
@@ -526,8 +545,8 @@ def draw_shift_plot(
     series = [
         np.asarray(raw_x[-history:], dtype=np.float32),
         np.asarray(raw_y[-history:], dtype=np.float32),
-        np.asarray(smooth_x[-history:], dtype=np.float32),
-        np.asarray(smooth_y[-history:], dtype=np.float32),
+        np.asarray(target_x[-history:], dtype=np.float32),
+        np.asarray(target_y[-history:], dtype=np.float32),
     ]
     valid_values = np.concatenate([values[np.isfinite(values)] for values in series if np.any(np.isfinite(values))])
     if len(valid_values) == 0:
@@ -564,7 +583,7 @@ def draw_shift_plot(
     draw_trace(series[3], (120, 220, 120), dotted=True)
 
     cv2.putText(plot, "raw x/y", (x0 + 8, y0 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (30, 80, 230), 2)
-    cv2.putText(plot, "smooth x/y", (x0 + 105, y0 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (90, 150, 90), 2)
+    cv2.putText(plot, "target x/y", (x0 + 105, y0 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (90, 150, 90), 2)
     cv2.putText(
         plot,
         f"frames {frame_min}-{recent_frames[-1]}",
@@ -600,14 +619,14 @@ def make_four_panel(
     stabilized: np.ndarray,
 ) -> np.ndarray:
     top = np.hstack([label_panel(original, "1. Original video"), label_panel(flow, "2. Key.Net motion overlay")])
-    bottom = np.hstack([plot, label_panel(stabilized, "4. Affine trajectory stabilized video")])
+    bottom = np.hstack([plot, label_panel(stabilized, "4. Frame-to-frame translation stabilized video")])
     return np.vstack([top, bottom])
 
 
 def write_csv(
     path: Path,
     trajectory: np.ndarray,
-    smoothed: np.ndarray,
+    target: np.ndarray,
     corrections: np.ndarray,
     motions: list[MotionEstimate],
 ) -> None:
@@ -619,9 +638,9 @@ def write_csv(
                 "raw_shift_x_px",
                 "raw_shift_y_px",
                 "raw_angle_deg",
-                "smooth_shift_x_px",
-                "smooth_shift_y_px",
-                "smooth_angle_deg",
+                "target_shift_x_px",
+                "target_shift_y_px",
+                "target_angle_deg",
                 "correction_x_px",
                 "correction_y_px",
                 "correction_angle_deg",
@@ -630,8 +649,8 @@ def write_csv(
                 "used_fallback",
             ]
         )
-        for index, (raw, smooth, correction, motion) in enumerate(
-            zip(trajectory, smoothed, corrections, motions),
+        for index, (raw, target_frame, correction, motion) in enumerate(
+            zip(trajectory, target, corrections, motions),
             start=1,
         ):
             writer.writerow(
@@ -640,9 +659,9 @@ def write_csv(
                     float(raw[0]),
                     float(raw[1]),
                     math.degrees(float(raw[2])),
-                    float(smooth[0]),
-                    float(smooth[1]),
-                    math.degrees(float(smooth[2])),
+                    float(target_frame[0]),
+                    float(target_frame[1]),
+                    math.degrees(float(target_frame[2])),
                     float(correction[0]),
                     float(correction[1]),
                     math.degrees(float(correction[2])),
@@ -660,7 +679,7 @@ def write_outputs(
     fps: float,
     frame_size: tuple[int, int],
     trajectory: np.ndarray,
-    smoothed: np.ndarray,
+    target: np.ndarray,
     corrections: np.ndarray,
     motions: list[MotionEstimate],
     args: argparse.Namespace,
@@ -693,8 +712,8 @@ def write_outputs(
     frame_numbers: list[int] = []
     raw_x: list[float] = []
     raw_y: list[float] = []
-    smooth_x: list[float] = []
-    smooth_y: list[float] = []
+    target_x: list[float] = []
+    target_y: list[float] = []
 
     frame_index = 0
     output_frame_count = min(len(corrections), args.num_frames) if args.num_frames > 0 else len(corrections)
@@ -721,16 +740,16 @@ def write_outputs(
         frame_numbers.append(frame_index + 1)
         raw_x.append(float(trajectory[frame_index, 0]))
         raw_y.append(float(trajectory[frame_index, 1]))
-        smooth_x.append(float(smoothed[frame_index, 0]))
-        smooth_y.append(float(smoothed[frame_index, 1]))
+        target_x.append(float(target[frame_index, 0]))
+        target_y.append(float(target[frame_index, 1]))
         plot = draw_shift_plot(
             width,
             height,
             frame_numbers,
             raw_x,
             raw_y,
-            smooth_x,
-            smooth_y,
+            target_x,
+            target_y,
             args.plot_history,
         )
 
@@ -739,8 +758,8 @@ def write_outputs(
                 stabilized,
                 [
                     f"raw dx={trajectory[frame_index, 0]:.2f}, dy={trajectory[frame_index, 1]:.2f}",
-                    f"smooth dx={smoothed[frame_index, 0]:.2f}, dy={smoothed[frame_index, 1]:.2f}",
-                    f"correction dx={correction[0]:.2f}, dy={correction[1]:.2f}, rot={math.degrees(correction[2]):.3f} deg",
+                    f"target dx={target[frame_index, 0]:.2f}, dy={target[frame_index, 1]:.2f}",
+                    f"applied inverse shift dx={correction[0]:.2f}, dy={correction[1]:.2f}",
                 ],
                 origin_y=58,
             )
@@ -781,8 +800,14 @@ def process_video(args: argparse.Namespace) -> None:
     print(f"Processing {frame_limit}")
 
     transforms, trajectory, motions, fps, frame_size = estimate_video_motion(args.input_video, extractor, args)
-    smoothed = centered_moving_average(trajectory, args.smoothing_radius)
-    corrections = smoothed - trajectory
+    if args.stabilization_mode == "frame-to-frame":
+        target = np.zeros_like(trajectory, dtype=np.float32)
+        corrections = -trajectory
+        corrections[:, 2] = 0.0
+    else:
+        target = centered_moving_average(trajectory, args.smoothing_radius)
+        corrections = target - trajectory
+        corrections[:, 2] = 0.0
 
     write_outputs(
         args.input_video,
@@ -791,13 +816,13 @@ def process_video(args: argparse.Namespace) -> None:
         fps,
         frame_size,
         trajectory,
-        smoothed,
+        target,
         corrections,
         motions,
         args,
     )
     if args.csv:
-        write_csv(args.csv, trajectory, smoothed, corrections, motions)
+        write_csv(args.csv, trajectory, target, corrections, motions)
 
     print(f"Wrote four-quadrant Key.Net stabilization video: {output_path}")
     if args.stable_output:
