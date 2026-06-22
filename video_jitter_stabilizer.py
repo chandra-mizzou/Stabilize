@@ -22,6 +22,7 @@ import numpy as np
 DEFAULT_MAX_FEATURES = 1500
 DEFAULT_MIN_MATCHES = 12
 DEFAULT_SMOOTHING_RADIUS = 15
+DEFAULT_NUM_FRAMES = 100
 
 
 @dataclass
@@ -72,6 +73,15 @@ def parse_args() -> argparse.Namespace:
         "--display",
         action="store_true",
         help="Show the four-quadrant video while processing. Press q to stop.",
+    )
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=DEFAULT_NUM_FRAMES,
+        help=(
+            "Number of frames to stabilize and plot from the start of the video "
+            f"(default: {DEFAULT_NUM_FRAMES}). Use 0 to process the full video."
+        ),
     )
     parser.add_argument(
         "--max-features",
@@ -372,7 +382,8 @@ def estimate_video_motion(
     ]
 
     frame_no = 1
-    while True:
+    max_frames = None if args.num_frames == 0 else args.num_frames
+    while max_frames is None or frame_no < max_frames:
         success, frame = cap.read()
         if not success:
             break
@@ -390,6 +401,7 @@ def estimate_video_motion(
         )
 
     cap.release()
+    print(f"estimated motion for {len(transforms)} frame(s)")
     transforms_np = np.asarray(transforms, dtype=np.float32)
     trajectory = np.cumsum(transforms_np, axis=0)
     return transforms_np, trajectory, motions, fps, (width, height)
@@ -685,11 +697,10 @@ def write_outputs(
     smooth_y: list[float] = []
 
     frame_index = 0
-    while True:
+    output_frame_count = min(len(corrections), args.num_frames) if args.num_frames > 0 else len(corrections)
+    while frame_index < output_frame_count:
         success, frame = cap.read()
         if not success:
-            break
-        if frame_index >= len(corrections):
             break
 
         correction = corrections[frame_index]
@@ -757,6 +768,8 @@ def process_video(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Input video does not exist: {args.input_video}")
     if args.max_features < 1:
         raise ValueError("--max-features must be at least 1")
+    if args.num_frames < 0:
+        raise ValueError("--num-frames must be non-negative")
     if args.smoothing_radius < 0:
         raise ValueError("--smoothing-radius must be non-negative")
     if args.border_scale < 1.0:
@@ -764,6 +777,8 @@ def process_video(args: argparse.Namespace) -> None:
 
     output_path = args.output or args.input_video.with_name(f"{args.input_video.stem}_keynet_stabilized.mp4")
     extractor = KeyNetHardNetExtractor(args.max_features, args.feature_max_size, args.device)
+    frame_limit = "all frames" if args.num_frames == 0 else f"first {args.num_frames} frame(s)"
+    print(f"Processing {frame_limit}")
 
     transforms, trajectory, motions, fps, frame_size = estimate_video_motion(args.input_video, extractor, args)
     smoothed = centered_moving_average(trajectory, args.smoothing_radius)

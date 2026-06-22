@@ -20,11 +20,16 @@ python3 -m pip install -r requirements.txt
 python3 video_jitter_stabilizer.py input.mp4 \
   --output output_jitter_analysis.mp4 \
   --stable-output stable_only.mp4 \
+  --num-frames 100 \
   --csv trajectory.csv
 ```
 
 Use `--display` to show the four-quadrant video while it is being processed.
 Press `q` to stop the live preview.
+
+By default, the script stabilizes and plots only the first 100 frames. Change
+the frame count with `--num-frames`; use `--num-frames 0` to process the full
+video.
 
 ## How stabilization works
 
@@ -63,6 +68,12 @@ For stronger stabilization, increase the radius, for example:
 python3 video_jitter_stabilizer.py input.mp4 --smoothing-radius 30
 ```
 
+To process only the first 250 frames:
+
+```bash
+python3 video_jitter_stabilizer.py input.mp4 --num-frames 250
+```
+
 Useful options:
 
 ```bash
@@ -76,6 +87,8 @@ Useful tuning options:
 
 - `--max-features`: more Key.Net features can improve matching on textured
   videos.
+- `--num-frames`: number of frames to stabilize and plot from the start of the
+  video; default is 100, and 0 means full video.
 - `--match-ratio`: lower values make matching stricter.
 - `--ransac-threshold`: higher values tolerate noisier matches.
 - `--border-scale`: zooms the stabilized frame slightly to hide borders.
