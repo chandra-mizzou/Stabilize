@@ -21,9 +21,9 @@ import numpy as np
 DEFAULT_TOP_K = 100
 DEFAULT_RESET_THRESHOLD = 10
 DEFAULT_NUM_FRAMES = 100
-DEFAULT_CROP_SIZE = 512
-DEFAULT_PROCESS_SIZE = 256
-DEFAULT_ANALYSIS_SIZE = 256
+DEFAULT_CROP_SIZE = 0
+DEFAULT_PROCESS_SIZE = 512
+DEFAULT_ANALYSIS_SIZE = 1024
 
 
 @dataclass
@@ -127,8 +127,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_CROP_SIZE,
         help=(
-            "Center crop each input frame to this square size before resizing "
-            f"for processing (default: {DEFAULT_CROP_SIZE}). Smaller frames are zero-padded."
+            "Optional center-crop size before resizing. Use 0 to process the "
+            f"full frame without cropping (default: {DEFAULT_CROP_SIZE})."
         ),
     )
     parser.add_argument(
@@ -303,15 +303,17 @@ def center_crop_or_pad_square(frame: np.ndarray, size: int) -> np.ndarray:
 
 
 def preprocess_frame(frame: np.ndarray, crop_size: int, process_size: int) -> np.ndarray:
-    """Center crop to crop_size x crop_size, then resize for processing."""
-    cropped = center_crop_or_pad_square(frame, crop_size)
-    if crop_size == process_size:
-        return cropped
-    return cv2.resize(cropped, (process_size, process_size), interpolation=cv2.INTER_AREA)
+    """Optionally center-crop, then resize full content to processing size."""
+    source = center_crop_or_pad_square(frame, crop_size) if crop_size > 0 else frame
+    if source.shape[0] == process_size and source.shape[1] == process_size:
+        return source
+    return cv2.resize(source, (process_size, process_size), interpolation=cv2.INTER_AREA)
 
 
 def make_analysis_frame(panel: np.ndarray, analysis_size: int) -> np.ndarray:
     """Resize the four-panel diagnostic view to the requested analysis size."""
+    if panel.shape[0] == analysis_size and panel.shape[1] == analysis_size:
+        return panel
     return cv2.resize(panel, (analysis_size, analysis_size), interpolation=cv2.INTER_AREA)
 
 
@@ -421,8 +423,35 @@ def draw_shift_plot(
     draw_trace(series[1], (30, 170, 30))
     draw_trace(series[2], (120, 150, 255), dotted=True)
     draw_trace(series[3], (120, 220, 120), dotted=True)
-    cv2.putText(plot, "shift x/y", (x0 + 8, y0 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (30, 80, 230), 2)
-    cv2.putText(plot, "correction x/y", (x0 + 125, y0 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (90, 150, 90), 2)
+
+    legend_items = [
+        ("shift x", (30, 80, 230), False),
+        ("shift y", (30, 170, 30), False),
+        ("correction x", (120, 150, 255), True),
+        ("correction y", (120, 220, 120), True),
+    ]
+    legend_x = x0 + 8
+    legend_y = y0 + 24
+    for index, (label, color, dotted) in enumerate(legend_items):
+        item_x = legend_x + (index % 2) * 175
+        item_y = legend_y + (index // 2) * 20
+        if dotted:
+            cv2.line(plot, (item_x, item_y), (item_x + 16, item_y), color, 2, cv2.LINE_AA)
+            cv2.line(plot, (item_x + 22, item_y), (item_x + 38, item_y), color, 2, cv2.LINE_AA)
+        else:
+            cv2.line(plot, (item_x, item_y), (item_x + 38, item_y), color, 2, cv2.LINE_AA)
+        cv2.putText(plot, label, (item_x + 46, item_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1, cv2.LINE_AA)
+
+    cv2.putText(
+        plot,
+        f"range +/- {max_abs:.1f} px",
+        (x0 + 8, y1 + 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (70, 70, 70),
+        1,
+        cv2.LINE_AA,
+    )
     return plot
 
 
@@ -491,8 +520,10 @@ def process_video(args: argparse.Namespace) -> None:
         raise ValueError("--reset-threshold must be non-negative")
     if args.num_frames < 0:
         raise ValueError("--num-frames must be non-negative")
-    if args.crop_size < 16:
-        raise ValueError("--crop-size must be at least 16")
+    if args.crop_size < 0:
+        raise ValueError("--crop-size must be non-negative")
+    if 0 < args.crop_size < 16:
+        raise ValueError("--crop-size must be 0 or at least 16")
     if args.process_size < 16:
         raise ValueError("--process-size must be at least 16")
     if args.analysis_size < 16:
@@ -513,11 +544,18 @@ def process_video(args: argparse.Namespace) -> None:
     if not success:
         raise RuntimeError(f"Could not read first frame: {args.input_video}")
 
-    print(
-        f"Center-cropping frames to {args.crop_size}x{args.crop_size}, "
-        f"then resizing to {args.process_size}x{args.process_size} before processing.",
-        flush=True,
-    )
+    if args.crop_size > 0:
+        print(
+            f"Center-cropping frames to {args.crop_size}x{args.crop_size}, "
+            f"then resizing to {args.process_size}x{args.process_size} before processing.",
+            flush=True,
+        )
+    else:
+        print(
+            f"Using full frames without cropping; resizing to "
+            f"{args.process_size}x{args.process_size} before processing.",
+            flush=True,
+        )
     print(
         f"Saving analysis video at {args.analysis_size}x{args.analysis_size}.",
         flush=True,
