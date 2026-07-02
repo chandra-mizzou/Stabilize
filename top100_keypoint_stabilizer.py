@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stabilize x/y jitter with top-100 Key.Net keypoint shifts.
+"""Stabilize x/y jitter with top Key.Net keypoint shifts.
 
 For each frame, this script extracts the top Key.Net keypoints, matches them to
 the immediate previous frame, averages the matched x/y shifts, and translates
@@ -18,12 +18,16 @@ import cv2
 import numpy as np
 
 
-DEFAULT_TOP_K = 100
-DEFAULT_RESET_THRESHOLD = 10
-DEFAULT_NUM_FRAMES = 100
+DEFAULT_TOP_K = 200
+DEFAULT_RESET_THRESHOLD = 20
+DEFAULT_NUM_FRAMES = 0
 DEFAULT_CROP_SIZE = 0
 DEFAULT_PROCESS_SIZE = 512
 DEFAULT_ANALYSIS_SIZE = 1024
+DEFAULT_STABILIZATION_MODE = "moving"
+DEFAULT_MOTION_ALPHA = 0.92
+DEFAULT_MAX_CORRECTION = 64.0
+DEFAULT_RESET_CORRECTION_DECAY = 0.9
 
 
 @dataclass
@@ -95,8 +99,8 @@ class KeyNetTopKExtractor:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Stabilize azimuth/elevation x/y jitter by averaging top-100 "
-            "Key.Net keypoint shifts between immediate consecutive frames."
+            "Stabilize azimuth/elevation x/y jitter by averaging top Key.Net "
+            "keypoint shifts between immediate consecutive frames."
         )
     )
     parser.add_argument("input_video", type=Path, help="Path to the input video file.")
@@ -104,7 +108,7 @@ def parse_args() -> argparse.Namespace:
         "-o",
         "--output",
         type=Path,
-        help="Four-quadrant analysis video path. Defaults to '<input>_top100_analysis.mp4'.",
+        help="Four-quadrant analysis video path. Defaults to '<input>_top<k>_analysis.mp4'.",
     )
     parser.add_argument(
         "--stable-output",
@@ -120,7 +124,10 @@ def parse_args() -> argparse.Namespace:
         "--num-frames",
         type=int,
         default=DEFAULT_NUM_FRAMES,
-        help=f"Number of frames to process from the start (default: {DEFAULT_NUM_FRAMES}; 0 means full video).",
+        help=(
+            "Number of frames to process from the start. "
+            f"Default {DEFAULT_NUM_FRAMES} means full video."
+        ),
     )
     parser.add_argument(
         "--crop-size",
@@ -154,6 +161,55 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_TOP_K,
         help=f"Number of top Key.Net keypoints per frame (default: {DEFAULT_TOP_K}).",
+    )
+    parser.add_argument(
+        "--stabilization-mode",
+        choices=["moving", "reference"],
+        default=DEFAULT_STABILIZATION_MODE,
+        help=(
+            "'moving' removes fast jitter while allowing slow camera/window motion; "
+            "'reference' aligns each segment to its reference and can create black "
+            "borders on moving video (default: moving)."
+        ),
+    )
+    parser.add_argument(
+        "--motion-alpha",
+        type=float,
+        default=DEFAULT_MOTION_ALPHA,
+        help=(
+            "Low-pass factor for intentional frame-to-frame motion in moving mode. "
+            "Higher values preserve slower drift and correct faster jitter "
+            f"(default: {DEFAULT_MOTION_ALPHA})."
+        ),
+    )
+    parser.add_argument(
+        "--max-correction",
+        type=float,
+        default=DEFAULT_MAX_CORRECTION,
+        help=(
+            "Maximum absolute x/y correction in pixels after resizing. This prevents "
+            f"large black borders on moving video (default: {DEFAULT_MAX_CORRECTION}; "
+            "0 disables clipping)."
+        ),
+    )
+    parser.add_argument(
+        "--reset-correction-decay",
+        type=float,
+        default=DEFAULT_RESET_CORRECTION_DECAY,
+        help=(
+            "When the reference keypoint set changes in moving mode, multiply the "
+            "current correction by this factor to avoid carrying stale offsets "
+            f"(default: {DEFAULT_RESET_CORRECTION_DECAY})."
+        ),
+    )
+    parser.add_argument(
+        "--shift-statistic",
+        choices=["median", "mean", "trimmed-mean"],
+        default="median",
+        help=(
+            "Statistic used to combine matched keypoint shifts. Median is more "
+            "robust to bad matches (default: median)."
+        ),
     )
     parser.add_argument(
         "--reset-threshold",
@@ -257,16 +313,34 @@ def average_shift(
     current_points: np.ndarray,
     min_matches: int,
     max_shift: float,
+    statistic: str,
 ) -> tuple[np.ndarray, bool]:
     if len(previous_points) < min_matches:
         return np.zeros(2, dtype=np.float32), False
     shifts = current_points - previous_points
-    mean_shift = np.mean(shifts, axis=0).astype(np.float32)
-    if not np.all(np.isfinite(mean_shift)):
+    if statistic == "mean":
+        estimated_shift = np.mean(shifts, axis=0)
+    elif statistic == "trimmed-mean" and len(shifts) >= 6:
+        lower = np.percentile(shifts, 20, axis=0)
+        upper = np.percentile(shifts, 80, axis=0)
+        keep = np.all((shifts >= lower) & (shifts <= upper), axis=1)
+        estimated_shift = np.mean(shifts[keep] if np.any(keep) else shifts, axis=0)
+    else:
+        estimated_shift = np.median(shifts, axis=0)
+
+    estimated_shift = estimated_shift.astype(np.float32)
+    if not np.all(np.isfinite(estimated_shift)):
         return np.zeros(2, dtype=np.float32), False
-    if float(np.linalg.norm(mean_shift)) > max_shift:
+    if float(np.linalg.norm(estimated_shift)) > max_shift:
         return np.zeros(2, dtype=np.float32), False
-    return mean_shift, True
+    return estimated_shift, True
+
+
+def clip_correction(correction: np.ndarray, max_correction: float) -> np.ndarray:
+    """Limit translation correction to reduce black borders on moving video."""
+    if max_correction <= 0:
+        return correction.astype(np.float32)
+    return np.clip(correction, -max_correction, max_correction).astype(np.float32)
 
 
 def translate_with_zero_padding(frame: np.ndarray, correction: np.ndarray) -> np.ndarray:
@@ -375,7 +449,7 @@ def draw_shift_plot(
     cv2.rectangle(plot, (x0, y1), (x1, y0), (35, 35, 35), 1)
     cv2.putText(
         plot,
-        "3. Top-100 keypoint x/y shifts",
+        "3. Top keypoint x/y shifts",
         (16, 24),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.65,
@@ -472,7 +546,7 @@ def label_panel(frame: np.ndarray, title: str) -> np.ndarray:
 
 
 def make_four_panel(original: np.ndarray, overlay: np.ndarray, plot: np.ndarray, stabilized: np.ndarray) -> np.ndarray:
-    top = np.hstack([label_panel(original, "1. Original video"), label_panel(overlay, "2. Top-100 Key.Net shifts")])
+    top = np.hstack([label_panel(original, "1. Original video"), label_panel(overlay, "2. Top Key.Net shifts")])
     bottom = np.hstack([plot, label_panel(stabilized, "4. Zero-padded stabilized video")])
     return np.vstack([top, bottom])
 
@@ -530,8 +604,14 @@ def process_video(args: argparse.Namespace) -> None:
         raise ValueError("--analysis-size must be at least 16")
     if args.progress_every < 1:
         raise ValueError("--progress-every must be at least 1")
+    if not 0.0 <= args.motion_alpha < 1.0:
+        raise ValueError("--motion-alpha must be in the range [0, 1)")
+    if args.max_correction < 0:
+        raise ValueError("--max-correction must be non-negative")
+    if not 0.0 <= args.reset_correction_decay <= 1.0:
+        raise ValueError("--reset-correction-decay must be in the range [0, 1]")
 
-    output_path = args.output or args.input_video.with_name(f"{args.input_video.stem}_top100_analysis.mp4")
+    output_path = args.output or args.input_video.with_name(f"{args.input_video.stem}_top{args.top_k}_analysis.mp4")
     cap = cv2.VideoCapture(str(args.input_video))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open input video: {args.input_video}")
@@ -588,6 +668,9 @@ def process_video(args: argparse.Namespace) -> None:
     print(f"frame 1: extracted {len(previous_features.points)} keypoints", flush=True)
     reference_correction = np.zeros(2, dtype=np.float32)
     cumulative_shift = np.zeros(2, dtype=np.float32)
+    moving_correction = np.zeros(2, dtype=np.float32)
+    slow_motion = np.zeros(2, dtype=np.float32)
+    slow_motion_initialized = False
 
     results = [
         FrameResult(1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, len(previous_features.points), 0, True)
@@ -607,6 +690,10 @@ def process_video(args: argparse.Namespace) -> None:
         stable_writer.write(first_frame)
 
     max_frames = None if args.num_frames == 0 else args.num_frames
+    print(
+        "Processing full video." if max_frames is None else f"Processing first {max_frames} frame(s).",
+        flush=True,
+    )
     frame_no = 1
     while max_frames is None or frame_no < max_frames:
         success, frame = cap.read()
@@ -619,24 +706,47 @@ def process_video(args: argparse.Namespace) -> None:
             print(f"frame {frame_no}: extracting top keypoints...", flush=True)
         current_features = extractor.extract(frame)
         matched_prev, matched_curr = match_top_keypoints(previous_features, current_features, args.match_ratio)
-        mean_shift, valid_shift = average_shift(matched_prev, matched_curr, args.min_matches, args.max_shift)
+        mean_shift, valid_shift = average_shift(
+            matched_prev,
+            matched_curr,
+            args.min_matches,
+            args.max_shift,
+            args.shift_statistic,
+        )
         if valid_shift:
             cumulative_shift += mean_shift
         else:
             mean_shift = np.zeros(2, dtype=np.float32)
 
-        correction = reference_correction - cumulative_shift
-        stabilized = translate_with_zero_padding(frame, correction)
-
         matched_count = int(len(matched_curr))
         changed_count = max(0, min(args.top_k, args.top_k - matched_count))
         reset_reference = changed_count >= args.reset_threshold or not valid_shift
+
+        if args.stabilization_mode == "reference":
+            correction = reference_correction - cumulative_shift
+        else:
+            if valid_shift:
+                if not slow_motion_initialized:
+                    slow_motion = mean_shift.copy()
+                    slow_motion_initialized = True
+                else:
+                    slow_motion = args.motion_alpha * slow_motion + (1.0 - args.motion_alpha) * mean_shift
+                jitter_shift = mean_shift - slow_motion
+                moving_correction -= jitter_shift
+            else:
+                moving_correction *= args.reset_correction_decay
+
+            correction = clip_correction(moving_correction, args.max_correction)
+
+        stabilized = translate_with_zero_padding(frame, correction)
+
         if frame_no % args.progress_every == 0:
             print(
                 f"frame {frame_no}: keypoints={len(current_features.points)}, "
                 f"matches={matched_count}, changed={changed_count}, "
                 f"shift=({mean_shift[0]:.2f}, {mean_shift[1]:.2f}), "
                 f"correction=({correction[0]:.2f}, {correction[1]:.2f}), "
+                f"mode={args.stabilization_mode}, "
                 f"reset={'yes' if reset_reference else 'no'}",
                 flush=True,
             )
@@ -690,14 +800,17 @@ def process_video(args: argparse.Namespace) -> None:
         )
 
         if args.display:
-            cv2.imshow("top-100 keypoint stabilizer", analysis_frame)
+            cv2.imshow("top keypoint stabilizer", analysis_frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
         previous_features = current_features
         if reset_reference:
-            reference_correction = correction.copy()
-            cumulative_shift = np.zeros(2, dtype=np.float32)
+            if args.stabilization_mode == "reference":
+                # In reference mode, do not carry the previous segment's offset.
+                # Carrying it is what pushed moving videos into black borders.
+                reference_correction = np.zeros(2, dtype=np.float32)
+                cumulative_shift = np.zeros(2, dtype=np.float32)
             print(f"frame {frame_no}: reset reference, changed top keypoints={changed_count}", flush=True)
 
     cap.release()

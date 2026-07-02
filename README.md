@@ -117,21 +117,24 @@ Useful tuning options:
 - `--ransac-threshold`: higher values tolerate noisier matches.
 - `--border-scale`: zooms the stabilized frame slightly to hide borders.
 
-## Top-100 keypoint shift stabilizer
+## Top keypoint shift stabilizer
 
-For pure azimuth/elevation jitter, `top100_keypoint_stabilizer.py` implements a
-more direct frame-to-frame translation correction:
+For azimuth/elevation jitter, `top100_keypoint_stabilizer.py` implements a
+direct frame-to-frame translation correction from Key.Net matches:
 
 ```bash
 python3 top100_keypoint_stabilizer.py input.mp4 \
   --stable-output top100_stable.mp4 \
   --output top100_analysis.mp4 \
   --csv top100_shifts.csv \
-  --num-frames 100 \
+  --num-frames 0 \
   --crop-size 0 \
   --process-size 512 \
   --analysis-size 1024
 ```
+
+`--num-frames 0` means process the full video. This is now the default, so if
+you omit `--num-frames`, the script processes the entire input.
 
 The script uses the full input frame by default, without center-cropping, and
 resizes it to `512x512` before Key.Net processing. The stabilized-only output is
@@ -149,24 +152,53 @@ for example `--crop-size 512`.
 Algorithm:
 
 1. Resize the full input frame to `512x512` by default.
-2. Detect the top 100 Key.Net keypoints in the previous frame and current frame.
+2. Detect the top 200 Key.Net keypoints in the previous frame and current frame
+   by default.
 3. Match the top-keypoint descriptors between immediate consecutive frames.
-4. Compute the average matched keypoint shift `(dx, dy)`.
-5. Accumulate the shift within the current reference segment.
-6. Move the current frame back by the inverse cumulative shift.
+4. Compute a robust matched keypoint shift `(dx, dy)`; median is the default.
+5. In default `--stabilization-mode moving`, estimate slow camera/window motion
+   with a low-pass filter and correct only the fast jitter component.
+6. Move the current frame by the inverse jitter correction.
 7. Use black zero-padding for newly exposed image regions so the resolution is
    unchanged.
-8. If at least 10 of the top 100 keypoints are no longer matched, make the
-   current frame the new reference segment.
+8. Report when many top keypoints change; in moving mode this is diagnostic and
+   does not force the video to align to an old reference.
+
+Why the earlier version could go black on one side:
+
+- It accumulated every x/y shift and aligned frames back to an old reference.
+- If the camera/window really moved, that real motion was treated as jitter.
+- The inverse correction became large, so the image was translated out of the
+  frame and black zero-padding filled the exposed side.
+
+The default `moving` mode avoids this by allowing slow drift and correcting only
+fast deviations. If you truly want to lock each segment to a reference frame,
+use:
+
+```bash
+python3 top100_keypoint_stabilizer.py input.mp4 --stabilization-mode reference
+```
+
+Residual jitter may remain because feature matches are noisy, some keypoints can
+belong to moving foreground objects, frame resizing reduces precision, jitter
+may include blur/rolling-shutter effects, and a single global x/y translation
+cannot correct non-uniform motion.
 
 Tune these options:
 
-- `--top-k 100`: number of top Key.Net keypoints.
+- `--top-k 200`: number of top Key.Net keypoints.
 - `--crop-size 0`: optional square center crop before resizing; 0 means no crop.
 - `--process-size 512`: square frame size used for keypoint extraction and
   stabilization.
 - `--analysis-size 1024`: final square size of the four-quadrant analysis video.
-- `--reset-threshold 10`: number of changed/unmatched top keypoints before a
+- `--stabilization-mode moving`: moving-video mode that preserves slow drift and
+  removes fast jitter. `reference` aligns to a segment reference.
+- `--motion-alpha 0.92`: higher values preserve slower motion and correct faster
+  jitter.
+- `--max-correction 64`: caps correction in resized pixels to limit black
+  borders; use 0 to disable.
+- `--shift-statistic median`: robust statistic for matched keypoint shifts.
+- `--reset-threshold 20`: number of changed/unmatched top keypoints before a
   reference reset.
 - `--match-ratio`: stricter or looser descriptor matching.
 - `--max-shift`: rejects implausibly large average shifts.
